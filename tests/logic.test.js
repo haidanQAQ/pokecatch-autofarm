@@ -124,7 +124,7 @@ function makeEnv(opts = {}) {
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
-             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts };`);
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -586,24 +586,61 @@ function rebuild(env, body) {
   eq(owned >= 32800, true, '32800 经验缺口下自有糖够 → 走「直接吃」分支');
   eq(owned >= 300000, false, '30 万经验缺口下自有糖不够 → 必须先问再吃');
 
-  /* 缺糖时怎么买最便宜：按「总花费」比，不是按单价 */
-  const p1 = api.lvPlanBuy(250000, counts, 100000, 20000);
+  /* 档位经验随进度缩放：读弹窗按钮的 +xxx，读不到才用常量 */
+  const fakeModal = (labels) => ({
+    querySelector: () => null,
+    querySelectorAll: () => labels.map((t) => ({ querySelector: () => ({ textContent: t }) })),
+  });
+  const scaled = api.lvXpMap(fakeModal(['+600', '+9.0k', '+150k', '+600k']));
+  eq(scaled['exp-candy-s'], 600, '小糖 600');
+  eq(scaled['exp-candy-m'], 9000, '中糖 9,000');
+  eq(scaled['exp-candy-xl'], 150000, 'XL 150,000');
+  eq(scaled['exp-candy-big'], 600000, 'MAX 600,000');
+  const fallback = api.lvXpMap(fakeModal([]));
+  eq(fallback['exp-candy-xl'], 250000, '读不到标签就退回源码常量');
+
+  /* 拆分买法：大档整除 → 余数给下一档 → 零头补一颗最小档 */
+  const bd1 = api.lvBreakdown(159000, scaled);
+  eq(bd1.parts.length, 2, '159,000 拆成两档');
+  eq(bd1.parts[0].id, 'exp-candy-xl', '先 1 颗 XL');
+  eq(bd1.parts[0].qty, 1, 'XL 一颗');
+  eq(bd1.parts[1].id, 'exp-candy-m', '余下 9,000 用 M 补');
+  eq(bd1.parts[1].qty, 1, 'M 一颗');
+  eq(bd1.totalXp, 159000, '合计正好 159,000');
+  eq(bd1.overshoot, 0, '不浪费');
+  eq(bd1.cost, 48000 + 7200, '花费 55,200（不是买 2 颗 XL 的 96,000）');
+
+  const bd2 = api.lvBreakdown(159100, scaled);
+  const small2 = bd2.parts.find((p) => p.id === 'exp-candy-s');
+  eq(small2.qty, 1, '余 100 经验不足最小档 → 补 1 颗小糖');
+  eq(bd2.overshoot, 500, '只多出 500 经验');
+
+  const bd3 = api.lvBreakdown(1250000, scaled);
+  eq(bd3.parts[0].id, 'exp-candy-big', '百万级先用 MAX');
+  eq(bd3.parts[0].qty, 2, '2 颗 MAX = 1,200,000');
+  eq(bd3.parts[1].id, 'exp-candy-m', '余 50,000 先给 M（150k 的 XL 装不下）');
+  eq(bd3.parts[1].qty, 5, '5 颗 M = 45,000');
+  eq(bd3.parts[2].qty, 9, '余 5,000 用 9 颗小糖（8 颗不够，补 1 颗）');
+
+  /* 预算边界 */
+  const p1 = api.lvPlanBuy(250000, null, 100000, 20000);
   eq(p1.ok, true, '可以买');
-  eq(p1.id, 'exp-candy-xl', '补 25 万经验最省的是 XL（48,000）');
-  eq(p1.qty, 1, '一颗就够');
-  eq(p1.cost, 48000, '花费 48,000');
+  eq(p1.cost, 48000, '25 万经验 = 1 颗 XL（48,000）');
   eq(p1.affordable, true, '预算内');
 
-  const p2 = api.lvPlanBuy(20000, {}, 100000, 20000);
-  eq(p2.id, 'exp-candy-m', '补 2 万经验最省的是 M（2 颗 14,400）');
-  eq(p2.cost, 14400, '花费 14,400');
+  const p2 = api.lvPlanBuy(20000, null, 100000, 20000);
+  eq(p2.cost, 13200, '2 万经验 = 1 M + 5 S（13,200），比 2 颗 M 便宜');
+  eq(p2.parts.length, 2, '两档');
 
-  const p3 = api.lvPlanBuy(20000, {}, 30000, 20000);
+  const p3 = api.lvPlanBuy(20000, null, 30000, 20000);
   eq(p3.affordable, false, '只剩 10,000 可用就不够');
-  eq(p3.maxQty, 1, '能买 1 颗');
+  eq(p3.maxQty, 1, '能买 1 颗最大那档');
 
-  eq(api.lvPlanBuy(0, {}, 999999, 0).ok, false, '不缺经验就不买');
-  eq(api.lvPlanBuy(5000, {}, 10000, 20000).ok, false, '金钱低于保留线不买');
+  eq(api.lvPlanBuy(0, null, 999999, 0).ok, false, '不缺经验就不买');
+  eq(api.lvPlanBuy(5000, null, 10000, 20000).ok, false, '金钱低于保留线不买');
+
+  /* 文案：按拆好的档位拼给人看 */
+  eq(api.lvPlanText(bd1), '1×经验糖XL + 1×经验糖M', '提示里写清买几颗哪种');
 }
 
 /* ---------------- 汇总 ---------------- */

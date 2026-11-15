@@ -124,7 +124,7 @@ function makeEnv(opts = {}) {
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
-             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText };`);
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -641,6 +641,15 @@ function rebuild(env, body) {
 
   /* 文案：按拆好的档位拼给人看 */
   eq(api.lvPlanText(bd1), '1×经验糖XL + 1×经验糖M', '提示里写清买几颗哪种');
+
+  /* 批量连点的安全上限：点完不越级才算安全，否则退化成一颗一颗 */
+  eq(api.lvBurstCount(300000, 150000, 5, 10), 2, '缺 30 万、单颗 15 万 → 最多连点 2 颗');
+  eq(api.lvBurstCount(159000, 600, 100, 10), 10, '小糖便宜，但批次上限 10 颗');
+  eq(api.lvBurstCount(159000, 600, 3, 10), 3, '只有 3 颗就最多点 3 颗');
+  eq(api.lvBurstCount(100, 600, 50, 10), 0, '缺口比单颗还小 → 不批量，交给单颗收尾');
+  eq(api.lvBurstCount(150000, 150000, 9, 10), 1, '刚好一颗的量只点 1 颗，绝不越级');
+  eq(api.lvBurstCount(0, 600, 50, 10), 0, '不缺经验就不点');
+  eq(api.lvBurstCount(159000, 600, 0, 10), 0, '没货就不点');
 }
 
 /* ---------------- 汇总 ---------------- */

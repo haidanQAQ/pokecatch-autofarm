@@ -124,7 +124,7 @@ function makeEnv(opts = {}) {
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
-             lvParseNum, lvPlanBuy, lvOwnedXp, lvFeedOrder, lvXpNeed, lvCounts };`);
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -566,11 +566,25 @@ function rebuild(env, body) {
   eq(counts['exp-candy-m'], 0, '没有中糖');
   eq(api.lvOwnedXp(counts), 2 * 1000 + 250000, '总经验 = 2×1000 + 1×250000');
 
-  /* 吃糖顺序：小的先吃，避免一颗大糖直接跳好几级 */
-  const order = api.lvFeedOrder(counts);
-  eq(order.length, 3, '三颗糖的吃法');
-  eq(order[0], 'exp-candy-s', '先吃小糖');
-  eq(order[2], 'exp-candy-xl', '最后才吃大糖');
+  /* 「先算再动手」：只列出刚好够用的糖，多余的糖不动 */
+  const plan1 = api.lvCoverPlan(counts, 2000);
+  eq(plan1.ids.length, 2, '差 2,000 经验只吃 2 颗小糖');
+  eq(plan1.ids[0], 'exp-candy-s', '先吃小糖');
+  eq(plan1.enough, true, '够用');
+  eq(api.lvCoverPlan(counts, 2500).ids[2], 'exp-candy-xl', '小糖吃完仍不够才轮到 XL');
+
+  const plan2 = api.lvCoverPlan(counts, 300000);
+  eq(plan2.enough, false, '自有糖不够时如实返回不够');
+  eq(plan2.xp, 252000, '够不够是按总经验算的');
+
+  const all = api.lvCoverPlan(counts, Infinity);
+  eq(all.ids.length, 3, '要「全吃」时返回全部糖');
+  eq(api.lvCoverPlan(counts, 0).ids.length, 0, '不需要经验就不吃');
+
+  /* 关键回归：够的时候不该问价，不够的时候必须在吃之前就知道 */
+  const owned = api.lvOwnedXp(counts);
+  eq(owned >= 32800, true, '32800 经验缺口下自有糖够 → 走「直接吃」分支');
+  eq(owned >= 300000, false, '30 万经验缺口下自有糖不够 → 必须先问再吃');
 
   /* 缺糖时怎么买最便宜：按「总花费」比，不是按单价 */
   const p1 = api.lvPlanBuy(250000, counts, 100000, 20000);

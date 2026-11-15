@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.9.0
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9 新增宝可梦详情「升到下一级」（先吃已有经验糖，不够再问买不买）
+// @version      3.9.1
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9.1 优化「升到下一级」：先算够不够再动手，不够时先问、问完才吃糖
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.9.0';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.9.1';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -4098,11 +4098,10 @@
   }
 
   /* ====================== 操作：宝可梦详情「升到下一级」 ====================== */
-  // 只在队伍详情弹窗里出现一个按钮：先吃自己有的糖，不够再问要不要花钱买。
-  // 关键点：
-  //  1) 升级只靠点游戏自己的 .dc-candy 按钮，不碰存档（脚本从不写存档）。
-  //  2) 剩余经验从弹窗的「经验值 a / b」读，读不到就不瞎报价格。
-  //  3) 买糖必须回商店（弹窗会挡住），所以记下队伍格子序号，买完按序号点回去。
+  // 顺序很重要：**先算，再动手**。
+  //   1) 读「经验值 a / b」拿到还差多少经验；
+  //   2) 用自有糖的总经验去比：够就直接吃，不够就先问你要不要买，问完才动糖。
+  // 只在队伍详情弹窗里出现一个按钮；升级只点游戏自己的 .dc-candy，绝不写存档。
   const LV_CANDIES = ['exp-candy-s', 'exp-candy-m', 'exp-candy-xl', 'exp-candy-big'];
   const LV_XP = { 'exp-candy-s': 1000, 'exp-candy-m': 15000, 'exp-candy-xl': 250000, 'exp-candy-big': 1000000 };
   const LV_PRICE = { 'exp-candy-s': 1200, 'exp-candy-m': 7200, 'exp-candy-xl': 48000, 'exp-candy-big': 96000 };
@@ -4123,13 +4122,14 @@
   function lvModal() { return document.querySelector('.modal.mon-modal'); }
 
   function lvModalLevel(m) {
+    if (!m) return null;
     const el = m.querySelector('.rt-lv') || m.querySelector('.dc-facts .v') || m.querySelector('.lvl');
-    const n = lvParseNum((el && el.textContent) || '');
-    return n;
+    return lvParseNum((el && el.textContent) || '');
   }
 
-  // 返回 { cur, max, need }；读不到返回 null（宁可不报价，也不乱算）
+  // 返回 { cur, max, need, text }；读不到返回 null（宁可不报价，也不乱算）
   function lvXpNeed(m) {
+    if (!m) return null;
     const span = m.querySelector('.dc-xp .xpbar > span') || m.querySelector('.xpbar > span');
     const t = (span && span.textContent) || '';
     const parts = t.split('/');
@@ -4151,14 +4151,22 @@
     return LV_CANDIES.reduce((a, id) => a + (counts[id] || 0) * LV_XP[id], 0);
   }
 
-  // 最省浪费的吃法：从最小的开始，够则停（升级后多余经验会带进下一级，所以不必精算）
-  function lvFeedOrder(counts) {
-    const order = [];
-    for (const id of LV_CANDIES) for (let i = 0; i < (counts[id] || 0); i++) order.push(id);
-    return order;
+  // 刚好够用的吃法：从小到大累加，够了就停（自带多余的糖不动）
+  function lvCoverPlan(counts, need) {
+    const ids = [];
+    let xp = 0;
+    if (!(need > 0)) return { ids: ids, xp: 0, enough: true };
+    for (const id of LV_CANDIES) {
+      for (let i = 0; i < (counts[id] || 0); i++) {
+        ids.push(id);
+        xp += LV_XP[id];
+        if (xp >= need) return { ids: ids, xp: xp, enough: true };
+      }
+    }
+    return { ids: ids, xp: xp, enough: xp >= need };
   }
 
-  // 还差 needXp 时，买哪种糖最便宜（同价位取大颗，减少点击）
+  // 还差 needXp 时，买哪种糖最便宜（按总花费比，不是单价）
   function lvPlanBuy(needXp, counts, money, floor) {
     if (!(needXp > 0)) return { ok: false, reason: '不需要额外经验' };
     const budget = Math.max(0, (Number(money) || 0) - (Number(floor) || 0));
@@ -4176,27 +4184,36 @@
     return Object.assign({ ok: true }, best);
   }
 
-  function lvDialog(text, okText) {
+  const lvWait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function lvFire(el) {
+    if (!el) return;
+    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch { }
+  }
+
+  function lvDialogBox(text, opts) {
     return new Promise((resolve) => {
       const wrap = document.createElement('div');
       wrap.className = 'pcauto-dialog';
       wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483200;display:flex;align-items:center;justify-content:center;background:rgba(4,7,14,.62)';
       const box = document.createElement('div');
-      box.style.cssText = 'max-width:340px;padding:16px 16px 12px;border-radius:14px;border:1px solid #2c3346;background:#141a26;color:#dbe3f0;font:13px/1.6 system-ui,sans-serif;box-shadow:0 18px 50px rgba(0,0,0,.55)';
+      box.style.cssText = 'max-width:360px;padding:16px 16px 12px;border-radius:14px;border:1px solid #2c3346;background:#141a26;color:#dbe3f0;font:13px/1.6 system-ui,sans-serif;box-shadow:0 18px 50px rgba(0,0,0,.55)';
       const p = document.createElement('div');
       p.style.cssText = 'white-space:pre-wrap';
       p.textContent = text;
-      const row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:8px;margin-top:12px';
-      const mk = (label, val, primary) => {
+      const col = document.createElement('div');
+      col.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:12px';
+      for (const o of opts) {
         const b = document.createElement('button');
-        b.textContent = label;
-        b.style.cssText = 'flex:1;padding:8px;border-radius:9px;cursor:pointer;font:inherit;border:1px solid ' + (primary ? '#3f7bd6' : '#2c3346') + ';background:' + (primary ? '#2f5fa8' : 'transparent') + ';color:' + (primary ? '#fff' : '#c7d0e0');
-        b.onclick = () => { try { wrap.remove(); } catch { } resolve(val); };
-        return b;
-      };
-      row.append(mk('取消', false, false), mk(okText || '购买并使用', true, true));
-      box.append(p, row);
+        b.textContent = o.label;
+        const primary = !!o.primary;
+        b.style.cssText = 'padding:9px;border-radius:9px;cursor:pointer;font:inherit;text-align:center;border:1px solid '
+          + (primary ? '#3f7bd6' : '#2c3346') + ';background:' + (primary ? '#2f5fa8' : 'transparent')
+          + ';color:' + (primary ? '#fff' : '#c7d0e0');
+        b.onclick = () => { try { wrap.remove(); } catch { } resolve(o.value); };
+        col.append(b);
+      }
+      box.append(p, col);
       wrap.append(box);
       document.body.append(wrap);
     });
@@ -4208,7 +4225,7 @@
     const btn = document.createElement('button');
     btn.id = 'pcauto-lvup';
     btn.className = 'dc-candy';
-    btn.title = '用已有经验糖升到下一级；不够时询问是否购买';
+    btn.title = '先算出够不够，再决定吃 / 买';
     btn.style.cssText = 'width:auto;padding:0 10px;font:12px/1 system-ui,sans-serif;color:#cfe0ff';
     btn.textContent = '升到下一级';
     btn.onclick = (ev) => {
@@ -4218,63 +4235,99 @@
     m.querySelector('.dc-candies').append(btn);
   }
 
-  async function lvWait(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-  function lvFire(el) {
-    if (!el) return;
-    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch { }
+  // 按清单逐颗点；每次重新查按钮，因为升级后弹窗会重绘
+  async function lvFeedList(ids) {
+    let fed = 0;
+    for (const id of ids) {
+      const m = lvModal();
+      if (!m) break;
+      const btn = m.querySelectorAll('.dc-candy')[LV_CANDIES.indexOf(id)];
+      if (!btn || btn.disabled) continue;
+      const before = lvModalLevel(m);
+      lvFire(btn);
+      fed++;
+      await lvWait(560);
+      const after = lvModalLevel(lvModal());
+      if (before != null && after != null && after > before) break;
+    }
+    return fed;
   }
 
   async function levelUpHere() {
     const m = lvModal();
     if (!m) return '没找到宝可梦详情窗口';
-    if (S.lvBusy) return '正在升中…';
+    if (S.lvBusy) return '正在算/升级中…';
     const startLv = lvModalLevel(m);
-    if (startLv == null) return '读不到等级，先关掉重开详情';
+    if (startLv == null) return '读不到等级，先关掉详情重开一次';
     if (startLv >= 100) return '已经是最高等级';
-    const need = lvXpNeed(m);
+
     const save = S.save || {};
     const counts = lvCounts(save);
-    if (lvOwnedXp(counts) <= 0 && !need) return '没有经验糖，也读不到经验值，无法估算';
+    const owned = lvOwnedXp(counts);
+    const need = lvXpNeed(m);
+    if (!need && owned <= 0) return '既没有经验糖，也读不到经验条，先关掉详情重开一次';
 
     S.lvBusy = true;
     try {
-      let fed = 0;
-      let cur = startLv;
-      const order = lvFeedOrder(counts);
-      for (const id of order) {
-        const idx = LV_CANDIES.indexOf(id);
-        const btn = m.querySelectorAll('.dc-candy')[idx];
-        if (!btn || btn.disabled) continue;
-        lvFire(btn);
-        fed++;
-        await lvWait(520);
-        const lv = lvModalLevel(m);
-        if (lv != null && lv > cur) { cur = lv; break; }
+      // ① 自有糖够 → 直接吃，不打扰你
+      if (need && owned >= need.need) {
+        const plan = lvCoverPlan(counts, need.need);
+        const fed = await lvFeedList(plan.ids);
+        const lv = lvModalLevel(lvModal()) || startLv;
+        if (lv > startLv) {
+          return `自有经验糖够用：吃了 ${fed} 颗，升到 Lv.${lv}（没花钱）`;
+        }
+        return fed ? `吃了 ${fed} 颗但等级没变（可能已达本章上限），未花钱` : '没有可用的经验糖';
       }
-      if (cur > startLv) {
-        return `已升到 Lv.${cur}（用掉 ${fed} 颗已有经验糖）`;
+
+      // ② 读不到经验条 → 只吃自有，绝不估价
+      if (!need) {
+        const all = lvCoverPlan(counts, Infinity);
+        const fed = await lvFeedList(all.ids);
+        const lv = lvModalLevel(lvModal()) || startLv;
+        return fed ? `读不到还差多少经验，只吃了现有 ${fed} 颗糖，当前 Lv.${lv}` : '没有可用的经验糖';
       }
-      // 糖吃完了还不够 → 问要不要买
-      const shortXp = need ? need.need : null;
-      if (!shortXp) {
-        return fed ? `已用掉 ${fed} 颗糖，但读不到还差多少经验，未自动购买` : '没有可用的经验糖，且读不到经验值';
+
+      // ③ 不够 → 先算清楚问你，问完才动
+      const short = Math.max(0, need.need - owned);
+      const plan = lvPlanBuy(short, counts, save.money, S.cfg.shopMoneyFloor);
+      const head = `还差 ${need.need.toLocaleString()} 经验；自有经验糖共 ${owned.toLocaleString()} 经验，缺 ${short.toLocaleString()}。`;
+      let askText;
+      let opts;
+      if (!S.cfg.lvAutoBuy) {
+        askText = `${head}\n设置里关了「缺糖时询问购买」，不会花钱。要先把现有的糖吃掉吗？`;
+        opts = [{ label: '只吃现有的', value: 'feed', primary: true }, { label: '取消（什么都不吃）', value: 'cancel' }];
+      } else if (!plan.ok) {
+        askText = `${head}\n按当前设置不自动购买（${plan.reason}）。要先把现有的糖吃掉吗？`;
+        opts = [{ label: '只吃现有的', value: 'feed', primary: true }, { label: '取消（什么都不吃）', value: 'cancel' }];
+      } else if (!plan.affordable) {
+        askText = `${head}\n买 ${plan.qty} 颗${LV_NAME[plan.id]} 需要 ${plan.cost.toLocaleString()} ₽，可用只有 ${plan.budget.toLocaleString()} ₽（这笔钱最多买 ${plan.maxQty} 颗，仍然不够）。\n要先把现有的糖吃掉吗？`;
+        opts = [{ label: '只吃现有的', value: 'feed', primary: true }, { label: '取消（什么都不吃）', value: 'cancel' }];
+      } else {
+        askText = `${head}\n买 ${plan.qty} 颗${LV_NAME[plan.id]} 花 ${plan.cost.toLocaleString()} ₽（现有 ${Number(save.money || 0).toLocaleString()} ₽），买完回来接着喂就能升到下一级。\n不买也可以只吃现有的糖。`;
+        opts = [
+          { label: `买 ${plan.qty} 颗（${plan.cost.toLocaleString()} ₽）并升级`, value: 'buy', primary: true },
+          { label: '只吃现有的', value: 'feed' },
+          { label: '取消（什么都不吃）', value: 'cancel' },
+        ];
       }
-      const plan = lvPlanBuy(shortXp, counts, save.money, S.cfg.shopMoneyFloor);
-      if (!plan.ok) return `还差 ${shortXp} 经验，但${plan.reason}`;
-      if (!plan.affordable) {
-        return `还差 ${shortXp} 经验，买 ${plan.qty} 颗${LV_NAME[plan.id]} 需要 ${plan.cost.toLocaleString()} ₽，超出可动用资金（可用 ${plan.budget.toLocaleString()} ₽）`;
+
+      const choice = await lvDialogBox(askText, opts);
+      if (choice === 'cancel') return '已取消：一颗糖都没吃，也没花钱';
+
+      if (choice === 'feed') {
+        const all = lvCoverPlan(counts, Infinity);
+        const fed = await lvFeedList(all.ids);
+        const lv = lvModalLevel(lvModal()) || startLv;
+        return fed ? `只吃了现有 ${fed} 颗糖：Lv.${lv}（到下一级还差约 ${short.toLocaleString()} 经验）` : '没有可用的经验糖';
       }
-      const yes = await lvDialog(`还差 ${shortXp.toLocaleString()} 经验。\n需要购买 ${plan.qty} 颗${LV_NAME[plan.id]}，花费 ${plan.cost.toLocaleString()} ₽（现有 ${Number(save.money || 0).toLocaleString()} ₽）。\n是否购买并使用？`, '购买并使用');
-      if (!yes) return '已取消购买';
+
       const bought = await lvBuyCandies(plan.id, plan.qty);
-      if (!bought.ok) return '购买失败：' + bought.reason;
-      // 买完回到队伍，重新打开这只的详情，把新糖吃掉
+      if (!bought.ok) return '采购失败：' + bought.reason;
       const again = await lvAfterBuy();
-      if (!again) return '糖已买到，但没能自动喂（请手动点开该宝可梦再按一次）';
-      return again;
+      return again || '糖已买到，但没能自动喂回去（请点开该宝可梦再按一次）';
     } catch (e) {
-      return '升级出错：' + (e && e.message || e);
+      return '升级出错：' + ((e && e.message) || e);
     } finally {
       S.lvBusy = false;
       S.lastActivityAt = now();
@@ -4288,12 +4341,10 @@
   }
 
   async function lvBuyCandies(id, qty) {
-    const prevId = (document.querySelector('.screen.active') || {}).id || '';
-    const prevKey = prevId.replace(/^screen-/, '') || 'team';
     let bought = 0;
     try {
-      const close = lvModal();
-      if (close) { const x = close.querySelector('.dc-x'); if (x) lvFire(x); }
+      const cur = lvModal();
+      if (cur) { const x = cur.querySelector('.dc-x'); if (x) lvFire(x); }
       await lvWait(300);
       lvGoto('shop');
       await lvWait(900);
@@ -4302,16 +4353,16 @@
       await lvWait(250);
       for (let i = 0; i < qty; i++) {
         const row = shopFindRow(id);
-        if (!row) return { ok: false, reason: '货架上找不到 ' + (LV_NAME[id] || id) };
+        if (!row) return { ok: bought > 0, reason: '货架上找不到 ' + (LV_NAME[id] || id), bought: bought };
         if (row.segBtn && !row.segBtn.classList.contains('on')) { lvFire(row.segBtn); await lvWait(160); }
         lvFire(row.buyBtn);
         await lvWait(700);
-        const conf = document.querySelector('#modal-root .modal button.btn.primary, #modal-root .modal .btn.primary');
+        const conf = document.querySelector('#modal-root .modal .btn.primary');
         if (conf && !conf.closest('.mon-modal')) lvFire(conf);
         await lvWait(650);
         bought++;
       }
-      return { ok: bought > 0, bought: bought, prevKey: prevKey };
+      return { ok: bought > 0, bought: bought };
     } catch (e) {
       return { ok: false, reason: (e && e.message) || '未知错误' };
     }
@@ -4330,30 +4381,21 @@
     if (!m) return null;
     lvButtonInto(m);
     const startLv = lvModalLevel(m);
-    const before = lvModalLevel(m);
     if (startLv == null) return null;
-    let cur = before;
-    for (const id of LV_CANDIES) {
-      const idx = LV_CANDIES.indexOf(id);
-      const btn = m.querySelectorAll('.dc-candy')[idx];
-      if (!btn || btn.disabled) continue;
-      lvFire(btn);
-      await lvWait(520);
-      const lv = lvModalLevel(m);
-      if (lv != null && lv > cur) { cur = lv; break; }
-    }
-    return cur > startLv ? `已升到 Lv.${cur}` : null;
+    const need = lvXpNeed(m);
+    const counts = lvCounts(S.save || {});
+    const ids = need ? lvCoverPlan(counts, need.need).ids : lvCoverPlan(counts, Infinity).ids;
+    const fed = await lvFeedList(ids);
+    const lv = lvModalLevel(lvModal()) || startLv;
+    return lv > startLv ? `买完已喂 ${fed} 颗，升到 Lv.${lv}` : (fed ? `买完喂了 ${fed} 颗，当前 Lv.${lv}` : null);
   }
-
 
   // 每拍检查：详情弹窗开着就把按钮挂上去（弹窗升级后会重绘，所以要反复补）
   function lvTick() {
     const m = lvModal();
-    if (!m) { if (S.lvBusy) return; S.lvSeenModal = false; return; }
-    S.lvSeenModal = true;
+    if (!m) return;
     lvButtonInto(m);
   }
-
 
   /* ====================== 主循环 ====================== */
 
@@ -4443,7 +4485,7 @@
     if (!S.awaySnap) { S.awaySnap = tallySnap(); S.awayLastSeen = now(); }
 
     // 挂到页面的 window 上，控制台里才能访问
-    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed }; } catch { /* 忽略 */ }
+    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed, lvCoverPlan, lvOwnedXp, lvCounts }; } catch { /* 忽略 */ }
     ensureRealDescs();   // 先存下原始描述符，之后无论保活开没开，isRealHidden() 都能读到真值
     startGradeWatcher();
     safeInterval('tick', tick, TICK_MS);

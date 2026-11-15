@@ -15,7 +15,7 @@ const path = require('path');
 const SRC = path.join(__dirname, '..', 'pokecatch-autofarm.user.js');
 const source = fs.readFileSync(SRC, 'utf8');
 
-const START = '/* ====================== 模块：商店自动补货';
+const START = '/* ====================== 模块：商店采购';
 const END = '/* ====================== 主循环';
 const from = source.indexOf(START);
 const to = source.indexOf(END, from);
@@ -120,7 +120,7 @@ function makeEnv(opts = {}) {
 
   const names = Object.keys(env);
   const factory = new Function(...names, `${moduleCode}
-    return { shopPlan, autoShop, settleShop, shopDiag, ledgerTick, ledgerAdd, ledgerToday, ledgerData,
+    return { shopPlan, autoShop, settleShop, shopFindRow, shopDiag, ledgerTick, ledgerAdd, ledgerToday, ledgerData,
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml };`);
@@ -138,34 +138,54 @@ function ok(cond, name, extra) {
 }
 function eq(a, b, name) { ok(a === b, name, `${JSON.stringify(a)} !== ${JSON.stringify(b)}`); }
 
-/* ---------------- 1. 补货清单 ---------------- */
+/* ---------------- 1. 采购清单（这店是固定货架：只有经验糖、进化石、一次性进化道具） ---------------- */
 
 {
-  const save = { money: 50000, items: {
-    'razz-berry': 5, 'starf-berry': 1, 'enigma-berry': 9, 'nanab-berry': 4,
-    'golden-razz-berry': 3, 'pinap-berry': 7, 'lansat-berry': 6, 'exp-candy-s': 0,
-  } };
-  const env = makeEnv({ save });
-  const plan = env.api.shopPlan(save, {
-    berryFamilies: { shiny: true, dex: true, rare: true, capture: true, xp: true, money: true },
-    shopKeepBerries: 3, shopKeepCandy: 0,
-  });
-  eq(plan.length, 1, '只补库存不足的那一种');
-  eq(plan[0].id, 'starf-berry', '缺口是 starf-berry');
-  eq(plan[0].need, 2, 'starf-berry 缺 2 颗');
+  /* 金钱到下限就什么都不买 */
+  const poor = makeEnv({ save: { money: 500, items: {} }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 1000 } });
+  const pp = poor.api.shopPlan(poor.S.save, poor.S.cfg);
+  eq(pp.ok, false, '金钱到下限就不采购');
+  ok(/下限/.test(pp.reason), '给出下限原因');
 
-  /* 关掉 xp family 后，pinap 不进清单 */
-  const plan2 = env.api.shopPlan({ items: { 'pinap-berry': 0 } }, {
-    berryFamilies: { xp: false }, shopKeepBerries: 3, shopKeepCandy: 0,
-  });
-  ok(!plan2.some((p) => p.id === 'pinap-berry'), 'family 关闭的树果不补');
+  /* 什么都没启用 → 明说不买 */
+  const idle = makeEnv({ save: { money: 200000, items: {} }, cfg: { shopKeepCandy: 0 } });
+  eq(idle.api.shopPlan(idle.S.save, idle.S.cfg).ok, false, '没有启用采购项时不瞎买');
 
-  /* 糖果：只挑一个最缺的档 */
-  const plan3 = env.api.shopPlan({ items: { 'exp-candy-s': 0, 'exp-candy-m': 0 } }, {
-    berryFamilies: {}, shopKeepBerries: 0, shopKeepCandy: 4,
-  });
-  eq(plan3.length, 1, '糖果只补一种');
-  eq(plan3[0].id, 'exp-candy-xl', '糖果按 xl→s 优先级取第一个缺口');
+  /* 预算够 → 候选按「每 ₽ 经验」从高到低排，最前一个是 big */
+  const rich = makeEnv({ save: { money: 200000, items: {} }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 0, shopDailyCap: 0 } });
+  const p1 = rich.api.shopPlan(rich.S.save, rich.S.cfg);
+  eq(p1.ok, true, '预算够就能采购');
+  eq(p1.picks.map((p) => p.id).join(','), 'exp-candy-big,exp-candy-xl,exp-candy-m,exp-candy-s', '四档按性价比排序');
+
+  /* 预算只够小档 → 买不起的档不列进来 */
+  const mid = makeEnv({ save: { money: 2000, items: {} }, cfg: { shopKeepCandy: 1, shopMoneyFloor: 0 } });
+  eq(mid.api.shopPlan(mid.S.save, mid.S.cfg).picks.map((p) => p.id).join(','), 'exp-candy-s', '只留买得起的档');
+
+  /* 已经买够的档跳过 */
+  const stocked = makeEnv({ save: { money: 300000, items: { 'exp-candy-big': 3, 'exp-candy-xl': 3 } }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 0 } });
+  eq(stocked.api.shopPlan(stocked.S.save, stocked.S.cfg).picks.map((p) => p.id).join(','), 'exp-candy-m,exp-candy-s', '够数的档不再买');
+
+  /* 日上限：今天已经花满就不再买 */
+  const capped = makeEnv({ save: { money: 500000, items: {} }, cfg: { shopKeepCandy: 1, shopMoneyFloor: 0, shopDailyCap: 50000 } });
+  capped.clock = Date.parse('2026-11-16T10:00:00+08:00');
+  capped.api.ledgerTick();
+  capped.api.ledgerAdd({ spent: 50000 });
+  const pc = capped.api.shopPlan(capped.S.save, capped.S.cfg);
+  eq(pc.ok, false, '日上限花满就停手');
+  ok(/上限/.test(pc.reason), '给出上限原因');
+
+  /* 一次性进化道具：买过的不再买 */
+  const once = makeEnv({ save: { money: 900000, items: {} }, cfg: { shopBuyOneOff: true, shopKeepCandy: 0, shopMoneyFloor: 0 } });
+  const p2 = once.api.shopPlan(once.S.save, once.S.cfg);
+  eq(p2.ok, true, '一次性道具可以采购');
+  eq(p2.picks[0].id, 'soothe-bell', '按清单顺序先买安抚之铃');
+  eq(p2.picks[0].kind, 'once', '标记为一次性道具');
+  once.S.save = { money: 900000, items: { 'soothe-bell': 1 } };
+  eq(once.api.shopPlan(once.S.save, once.S.cfg).picks[0].id, 'kings-rock', '已经有的跳过');
+
+  /* 买不起 50 万时不要列一次性道具 */
+  const cheap = makeEnv({ save: { money: 300000, items: {} }, cfg: { shopBuyOneOff: true, shopKeepCandy: 0, shopMoneyFloor: 0 } });
+  eq(cheap.api.shopPlan(cheap.S.save, cheap.S.cfg).ok, false, '钱不够就不买 50 万的进化道具');
 }
 
 /* ---------------- 2. autoShop 的防护与点击顺序 ---------------- */
@@ -176,19 +196,19 @@ function mockShopDom(rows) {
   const rowById = new Map(rows.map((r) => [r.id, {
     tag: r.id,
     dataset: { id: r.id },
-    disabled: false,
     classList: { contains: (c) => (r.locked ? c === 'locked' : false) },
-    querySelector: (sel) => (sel === '.sh-buy button.buy' ? buyBtn : sel === '.sh-lock, .sh-find' ? null : null),
-    querySelectorAll: (sel) => (sel === '.sh-buy .seg button' ? [seg1] : []),
+    querySelector: (sel) => (String(sel).includes('button.buy') ? (r.locked ? null : buyBtn) : null),
+    querySelectorAll: (sel) => (String(sel).includes('.seg button') ? [seg1] : []),
   }]));
   return {
     buyBtn,
+    seg1,
     document: {
       querySelector: (sel) => {
         if (sel === '#shop-grid') return {};
         if (sel === '[data-go="shop"]') return null;
         if (sel === '#screen-shop [data-sh-mode="buy"]') return { classList: { contains: () => true } };
-        const m = /#shop-grid \.sh-item\[data-id="(.+)"\]/.exec(sel);
+        const m = /data-id="(.+)"\]/.exec(String(sel));
         if (m) return rowById.get(m[1]) || null;
         return null;
       },
@@ -197,39 +217,51 @@ function mockShopDom(rows) {
   };
 }
 
-{
-  const save = { money: 5000, items: { 'razz-berry': 0 } };
-  const env = makeEnv({ save, cfg: { shopKeepBerries: 3, shopKeepCandy: 0, shopMoneyFloor: 1000, shopDailyCap: 0 } });
-  const dom = mockShopDom([{ id: 'starf-berry' }, { id: 'razz-berry' }]);
-  env.document = dom.document;
-  /* 重建闭包里的 document 引用 */
-  env.api = new Function(...Object.keys(env).filter((k) => k !== 'api'),
-      `${moduleCode}\n return { autoShop };`)(...Object.keys(env).filter((k) => k !== 'api').map((k) => env[k]));
+function rebuild(env, body) {
+  const names = Object.keys(env).filter((k) => k !== 'api');
+  return new Function(...names, `${moduleCode}\n return ${body};`)(...names.map((k) => env[k]));
+}
 
+{
+  /* 最划算的 big 有货就买 big */
+  const save = { money: 300000, items: {} };
+  const env = makeEnv({ save, cfg: { shopKeepCandy: 3, shopMoneyFloor: 1000, shopDailyCap: 0 } });
+  const dom = mockShopDom([{ id: 'exp-candy-big' }, { id: 'exp-candy-s' }]);
+  env.document = dom.document;
+  env.api = rebuild(env, '{ autoShop }');
   env.clock = 1000;
   env.api.autoShop(true);
-  ok(env.fired.includes(dom.buyBtn), '余额充足时点了购买按钮');
-  ok(env.fired.some((el) => el.tag === 'seg1'), '没选中数量档位时先点 ×1');
-  eq(env.logs.filter((l) => l.includes('补货待命')).length, 0, '商店开着就不提示待命');
+  ok(env.fired.includes(dom.buyBtn), '点了购买按钮');
+  ok(env.fired.includes(dom.seg1), '没选数量档时先点 ×1');
+  ok(!!env.S.shopPending, '记下待结算的订单');
 
-  /* 余额保护 */
-  const poor = makeEnv({ save: { money: 500, items: { 'razz-berry': 0 } }, cfg: { shopMoneyFloor: 1000 } });
-  poor.document = mockShopDom([{ id: 'razz-berry' }]).document;
-  poor.api = new Function(...Object.keys(poor).filter((k) => k !== 'api'),
-      `${moduleCode}\n return { autoShop };`)(...Object.keys(poor).filter((k) => k !== 'api').map((k) => poor[k]));
+  /* 余额保护：钱低于下限一颗都不买 */
+  const poor = makeEnv({ save: { money: 500, items: {} }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 1000 } });
+  const pdom = mockShopDom([{ id: 'exp-candy-s' }]);
+  poor.document = pdom.document;
+  poor.api = rebuild(poor, '{ autoShop }');
   poor.clock = 1000;
   poor.api.autoShop(true);
   eq(poor.fired.length, 0, '金钱低于下限一颗都不买');
 
-  /* 锁住的行不点 */
-  const locked = makeEnv({ save: { money: 90000, items: { 'starf-berry': 0 } }, cfg: { shopKeepBerries: 3, shopMoneyFloor: 1000 } });
-  const ldom = mockShopDom([{ id: 'starf-berry', locked: true }]);
-  locked.document = ldom.document;
-  locked.api = new Function(...Object.keys(locked).filter((k) => k !== 'api'),
-      `${moduleCode}\n return { autoShop };`)(...Object.keys(locked).filter((k) => k !== 'api').map((k) => locked[k]));
-  locked.clock = 1000;
-  locked.api.autoShop(true);
-  ok(!locked.fired.includes(ldom.buyBtn), '徽章未解锁的行不会被点');
+  /* 最划算的档锁着 → 顺延到下一档，而不是原地跳过 */
+  const lock = makeEnv({ save: { money: 300000, items: {} }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 0, shopDailyCap: 0 } });
+  const ldom = mockShopDom([{ id: 'exp-candy-big', locked: true }, { id: 'exp-candy-xl' }]);
+  lock.document = ldom.document;
+  lock.api = rebuild(lock, '{ autoShop }');
+  lock.clock = 1000;
+  lock.api.autoShop(true);
+  ok(lock.fired.includes(ldom.buyBtn), '锁档时换下一档并成功下单');
+  eq((lock.S.shopPending || {}).id, 'exp-candy-xl', '实际下单的是 xl');
+
+  /* 货架上什么都没有 → 不点，只在日志里说一次原因 */
+  const miss = makeEnv({ save: { money: 300000, items: {} }, cfg: { shopKeepCandy: 3, shopMoneyFloor: 0 } });
+  miss.document = mockShopDom([]).document;
+  miss.api = rebuild(miss, '{ autoShop }');
+  miss.clock = 1000;
+  miss.api.autoShop(true);
+  eq(miss.fired.length, 0, '货架没货就不点');
+  ok(miss.logs.some((l) => l.includes('没有能下单的商品')), '日志说明为什么没买');
 }
 
 /* ---------------- 3. 账本 ---------------- */

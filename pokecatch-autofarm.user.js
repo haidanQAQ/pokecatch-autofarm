@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.8.0
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增商店自动补货、每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒
+// @version      3.8.1
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.8.0';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.8.1';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -105,13 +105,13 @@
     pushType: 'ntfy',        // bark / ntfy / telegram
     pushOnlyAway: true,      // 只在您不在电脑前时推送（标签页在后台，或 5 分钟没操作）
     pushEvents: { shiny: true, event: true, stall: true, manual: true, badge: false, death: false },
-    // 商店自动补货（把「自动吃树果」的增益链接上，别让它断供）
+    // 商店采购（这店是固定货架、不卖树果：只有经验糖 / 进化石 / 一次性进化道具）
     autoShop: false,
-    shopKeepBerries: 3,       // 每种已启用的增益树果补到几颗
-    shopKeepCandy: 0,         // 经验糖补到几颗（0 = 不补）
+    shopKeepCandy: 3,         // 经验糖补到几颗（0 = 不买）；实际会挑买得起且每 ₽ 经验最高的那档
+    shopBuyOneOff: false,     // 顺便买 50 万的一次性进化道具（每件只能买一次）
     shopMoneyFloor: 20000,    // 金钱低于此值一律不买
-    shopDailyCap: 300000,     // 每天补货最多花多少 ₽（0 = 不限）
-    shopEveryMin: 10,         // 补货检查间隔（分钟）
+    shopDailyCap: 300000,     // 每天采购最多花多少 ₽（0 = 不限）
+    shopEveryMin: 10,         // 采购检查间隔（分钟）
     // 数据分析
     daycareWatch: true,       // 培育屋监控（蛋位 / 孵化 / 闪光亲代提示）
     ledger: true,             // 每日产出账本
@@ -3016,15 +3016,15 @@
       ${chk('casinoAuto', '游戏城：进入后自动挂老虎机（消耗金钱）')}
       ${num('casinoFloor', '金钱低于多少 ₽ 停手', 0, 100000000, 1000)}
 
-      ${group('商店自动补货（增益续航）')}
-      ${chk('autoShop', '按需补树果 / 糖果（需要商店页开着）')}
-      ${num('shopKeepBerries', '每种增益树果补到几颗', 0, 99, 1)}
-      ${num('shopKeepCandy', '经验糖补到几颗（0 = 不补）', 0, 99, 1)}
+      ${group('商店采购（经验糖 · 固定货架不卖树果）')}
+      ${chk('autoShop', '自动买经验糖（需要商店页开着）')}
+      ${num('shopKeepCandy', '经验糖囤到几颗（0 = 不买；自动挑最划算的档）', 0, 99, 1)}
+      ${chk('shopBuyOneOff', '顺便买 50 万的一次性进化道具（每件只能买一次）')}
       ${num('shopMoneyFloor', '金钱低于多少 ₽ 不买', 0, 100000000, 1000)}
       ${num('shopDailyCap', '每天最多花多少 ₽（0 = 不限）', 0, 100000000, 1000)}
-      ${num('shopEveryMin', '补货检查间隔（分钟）', 1, 240, 1)}
+      ${num('shopEveryMin', '采购检查间隔（分钟）', 1, 240, 1)}
       <div style="display:flex;gap:6px;padding:4px 0">
-        <button id="pcauto-shop-now" style="${smallBtn}">立即补货一次</button>
+        <button id="pcauto-shop-now" style="${smallBtn}">立即采购一次</button>
         <button id="pcauto-shop-diag" style="${smallBtn}">商店探测</button>
       </div>
 
@@ -3251,7 +3251,7 @@
       const r = await feedAllCandy();
       log('item', '喂糖结果：' + r);
     };
-    /* ---- 补货 / 账本 / 图鉴 ---- */
+    /* ---- 采购 / 账本 / 图鉴 ---- */
     const shopNowBtn = $('#pcauto-shop-now', box);
     if (shopNowBtn) shopNowBtn.onclick = () => { box.remove(); S.shopAt = 0; autoShop(true); };
     const shopDiagBtn = $('#pcauto-shop-diag', box);
@@ -3276,43 +3276,88 @@
     box.onclick = (e) => { if (e.target === box) box.remove(); };
   }
 
-  /* ====================== 模块：商店自动补货（增益续航） ====================== */
+  /* ====================== 模块：商店采购（经验糖 / 一次性进化道具） ====================== */
 
-  /* 商店行结构（bundle 内 sh-item 模板，2026-11 版）：
-       <div class="sh-item" data-id="razz-berry">
-         <div class="sh-ic">…<span class="have">×12</span></div>
-         <div class="sh-name"><h4>树果名</h4><small>效果</small></div>
-         <div class="sh-buy">
-           <div class="seg"><button data-n="1" class="on">×1</button><button data-n="10">×10</button><button data-n="max">Max</button></div>
-           <button class="btn primary buy">Acheter</button>
-         </div>
-       </div>
-     未解锁的行带 .locked，行内会有 .sh-lock（差徽章）或 .sh-find（还没在途中找到过）；
-     买不起时按钮直接 disabled。所有点击都走 fire()，和脚本其它模块一条路。 */
+  /* 事实（2026-11 版 bundle 的 Ke.SHOP 常量，已核对）：这家店是**固定货架**——
+     不刷新、不轮换，而且**不卖树果**（树果只能从冒险/背包来；BERRY_BADGES 是树果增益的
+     徽章门槛，不是货架）。钱店只卖三类东西：
+       1. 经验糖 exp-candy-s / m / xl / big：1,200 / 7,200 / 48,000 / 96,000 ₽
+          （徽章门槛 0 / 3 / 6 / 8；每 ₽ 换到的经验是 0.83 / 2.08 / 5.21 / 10.4，
+           所以「买得起的最贵那档」就是最优解，不需要用户选档）
+       2. 进化石 fire/water/thunder/leaf/moon/sun/shiny/dusk/dawn/ice/oval-stone：100,000 ₽ 一口价
+          （脚本不知道你要进化谁，所以不自动买石头——买了大概率闲置）
+       3. 一次性进化道具 soothe-bell、kings-rock、metal-coat、dragon-scale、prism-scale、
+          deep-sea-tooth/scale、protector、electirizer、magmarizer、reaper-cloth、razor-claw/fang：
+          500,000 ₽，每件只能买一次
 
-  const SHOP_BERRY_IDS = ['starf-berry', 'enigma-berry', 'nanab-berry', 'golden-razz-berry', 'razz-berry', 'pinap-berry', 'lansat-berry'];
-  const SHOP_CANDY_IDS = ['exp-candy-xl', 'exp-candy-big', 'exp-candy-m', 'exp-candy-s'];
+     商店行结构（sh-item 模板）：
+       <div class="sh-item" data-id="exp-candy-m"> … <div class="sh-buy">
+         <div class="seg"><button data-n="1" class="on">×1</button><button data-n="10">×10</button>
+         <button data-n="max">Max</button></div><button class="btn primary buy">Acheter</button></div></div>
+     带 qty 的才有 .seg；一次性道具没有数量档，只有 sh-bottom 里的购买按钮。
+     未解锁行带 .locked（.sh-lock = 差徽章，.sh-find = 还没在途中找到过）。 */
 
-  /** 补货清单：只补「你已经在吃」的东西，不把存款花在没启用的 family 上 */
+  const SHOP_EXP = {
+    'exp-candy-s': { xp: 1000, price: 1200, badges: 0 },
+    'exp-candy-m': { xp: 15000, price: 7200, badges: 3 },
+    'exp-candy-xl': { xp: 250000, price: 48000, badges: 6 },
+    'exp-candy-big': { xp: 1000000, price: 96000, badges: 8 },
+  };
+  /** 每 ₽ 经验从高到低；「买得起的最前一个」就是最优档 */
+  const SHOP_CANDY_ORDER = ['exp-candy-big', 'exp-candy-xl', 'exp-candy-m', 'exp-candy-s'];
+  const SHOP_ONCE_IDS = [
+    'soothe-bell', 'kings-rock', 'metal-coat', 'dragon-scale', 'prism-scale',
+    'deep-sea-tooth', 'deep-sea-scale', 'protector', 'electirizer', 'magmarizer',
+    'reaper-cloth', 'razor-claw', 'razor-fang',
+  ];
+  const SHOP_ONCE_PRICE = 500000;
+
+  /**
+   * 采购清单：按优先级排好候选（纯函数，方便离线测试）
+   * 一次只买一件 —— 买贵东西宁可多跑几趟，也别一把把钱花光。
+   * @returns {{ok:boolean, reason?:string, picks:Array<{id:string,price:number,kind:string,note:string}>}}
+   */
   function shopPlan(save, cfg) {
     const items = (save && save.items) || {};
-    const fams = cfg.berryFamilies || {};
-    const keepBerry = clamp(cfg.shopKeepBerries | 0, 0, 99);
-    const keepCandy = clamp(cfg.shopKeepCandy | 0, 0, 99);
-    const out = [];
-    if (keepBerry > 0) {
-      for (const id of SHOP_BERRY_IDS) {
-        const meta = BERRY_BUFFS[id];
-        if (!meta || fams[meta.family] === false) continue;
-        const have = items[id] || 0;
-        if (have < keepBerry) out.push({ id, need: keepBerry - have, label: `${meta.label}×${meta.mult}` });
+    const money = (save && save.money) || 0;
+    const floor = Math.max(0, cfg.shopMoneyFloor | 0);
+    if (money <= floor) {
+      return { ok: false, reason: `金钱 ${fmt(money)} ₽ 已在下限 ${fmt(floor)} ₽ 以内`, picks: [] };
+    }
+    let budget = money - floor;
+    const cap = Math.max(0, cfg.shopDailyCap | 0);
+    if (cap > 0) {
+      const spent = ledgerToday().spent || 0;
+      budget = Math.min(budget, cap - spent);
+      if (budget <= 0) return { ok: false, reason: `今日已花 ${fmt(spent)} ₽，到达上限 ${fmt(cap)} ₽`, picks: [] };
+    }
+
+    const picks = [];
+    if (cfg.shopBuyOneOff) {
+      for (const id of SHOP_ONCE_IDS) {
+        if ((items[id] || 0) > 0) continue;          // 买过就不再买（这游戏的一次性道具买完就下架）
+        if (SHOP_ONCE_PRICE > budget) break;         // 预算不够，剩下的也都买不起
+        picks.push({ id, price: SHOP_ONCE_PRICE, kind: 'once', note: '一次性进化道具' });
       }
     }
-    if (keepCandy > 0) {
-      const id = SHOP_CANDY_IDS.find((c) => (items[c] || 0) < keepCandy);
-      if (id) out.push({ id, need: keepCandy - (items[id] || 0), label: id });
+    const keep = clamp(cfg.shopKeepCandy | 0, 0, 99);
+    if (keep > 0) {
+      for (const id of SHOP_CANDY_ORDER) {
+        const meta = SHOP_EXP[id];
+        if (!meta) continue;
+        if ((items[id] || 0) >= keep) continue;      // 这一档已经够数
+        if (meta.price > budget) continue;           // 买不起就换更便宜的档
+        picks.push({ id, price: meta.price, kind: 'candy', note: `经验糖（${fmt(meta.xp)} XP/颗）` });
+      }
     }
-    return out;
+    if (!picks.length) {
+      return {
+        ok: false,
+        reason: keep > 0 ? '经验糖已到目标颗数，或没有买得起的档位' : '没有启用任何采购项',
+        picks: [],
+      };
+    }
+    return { ok: true, picks };
   }
 
   function shopScreenOpen() { return !!document.querySelector('#shop-grid'); }
@@ -3324,8 +3369,19 @@
     return false;
   }
 
+  /** 找出可以立刻下单的那一行：存在、没锁、购买按钮可用 */
+  function shopFindRow(id) {
+    const row = document.querySelector(`#shop-grid .sh-item[data-id="${id}"]`);
+    if (!row) return { row: null, why: '货架上没有这件' };
+    if (row.classList.contains('locked') || row.querySelector('.sh-lock')) return { row: null, why: '徽章不够（行是锁的）' };
+    const buyBtn = row.querySelector('.sh-buy button.buy, .sh-bottom button.buy');
+    if (!buyBtn) return { row: null, why: '找不到购买按钮' };
+    if (buyBtn.disabled) return { row: null, why: '购买按钮是灰的（钱不够）' };
+    return { row, buyBtn, why: '' };
+  }
+
   /**
-   * @param force 设置面板的「立即补货一次」会跳过冷却
+   * @param force 设置面板的「立即采购一次」会跳过冷却
    */
   function autoShop(force = false) {
     if (!S.cfg.autoShop && !force) return;
@@ -3339,31 +3395,21 @@
     if (S.shopBusy && now() - S.shopBusy < 4000) return;      // 上一次点击还在结算
     if (isRealHidden() && !S.keepAliveOn) return;
 
-    const floor = Math.max(0, S.cfg.shopMoneyFloor | 0);
-    const money = save.money || 0;
-    if (money <= floor) { S.shopAt = now(); return; }          // 余额保护
-
     const plan = shopPlan(save, S.cfg);
-    if (!plan.length) { S.shopAt = now(); return; }
-
-    const cap = Math.max(0, S.cfg.shopDailyCap | 0);
-    if (cap > 0 && ledgerToday().spent >= cap) {
-      if (!S.shopCapWarnAt || now() - S.shopCapWarnAt > 3600000) {
-        S.shopCapWarnAt = now();
-        log('warn', `今日补货已花 ${fmt(ledgerToday().spent)} ₽，到日上限，暂停到今天结束`);
-      }
+    if (!plan.ok) {
       S.shopAt = now();
+      if (force) log('info', `不用采购：${plan.reason}`);
       return;
     }
 
     if (!shopScreenOpen()) {
-      if (now() - (S.shopOpenTriedAt || 0) > 60000) {
+      if (!S.shopOpenTriedAt || now() - S.shopOpenTriedAt > 60000) {
         S.shopOpenTriedAt = now();
         if (tryOpenShop()) return;                             // 下个 tick 再看结果
       }
-      if (now() - (S.shopHintAt || 0) > 600000) {
+      if (!S.shopHintAt || now() - S.shopHintAt > 600000) {
         S.shopHintAt = now();
-        log('info', '补货待命：需要商店页（Boutique）开着，脚本才能下单');
+        log('info', '采购待命：需要商店页（Boutique）开着，脚本才能下单');
       }
       S.shopAt = now();
       return;
@@ -3373,30 +3419,32 @@
     const buyTab = document.querySelector('#screen-shop [data-sh-mode="buy"]');
     if (buyTab && !buyTab.classList.contains('on')) { fire(buyTab); S.shopAt = now(); return; }
 
-    const want = plan[0];
-    const sel = `#shop-grid .sh-item[data-id="${want.id}"]`;
-    const row = document.querySelector(sel);
-    if (!row) {
-      if (now() - (S.shopMissAt || 0) > 600000) {
+    /* 依次尝试候选，取第一个真能下单的（最划算的档锁着就往下换） */
+    let hit = null;
+    const why = [];
+    for (const pick of plan.picks) {
+      const found = shopFindRow(pick.id);
+      if (found.row) { hit = { pick, found }; break; }
+      why.push(`${pick.id}: ${found.why}`);
+    }
+    if (!hit) {
+      if (!S.shopMissAt || now() - S.shopMissAt > 600000) {
         S.shopMissAt = now();
-        log('info', `商店里没有 ${want.id}（徽章不够或还没在途中找到过），本轮跳过`);
+        log('info', `没有能下单的商品（${why.join('；')}）`);
       }
       S.shopAt = now();
       return;
     }
-    if (row.classList.contains('locked') || row.querySelector('.sh-lock, .sh-find')) { S.shopAt = now(); return; }
 
-    const buyBtn = row.querySelector('.sh-buy button.buy');
-    if (!buyBtn || buyBtn.disabled) { S.shopAt = now(); return; }
-
-    /* 数量档位：默认 ×1 最省，缺口大也一单一颗地补，避免一次买空余额 */
-    const segs = [...row.querySelectorAll('.sh-buy .seg button')];
+    const { pick, found } = hit;
+    /* 数量档位：一律 ×1，避免一次买空余额（一单一颗地补，间隔自己会再来） */
+    const segs = [...found.row.querySelectorAll('.sh-buy .seg button')];
     if (segs.length && !segs.some((b) => b.classList.contains('on'))) fire(segs[0]);
 
     S.shopBusy = now();
     S.shopAt = now();
-    S.shopPending = { id: want.id, money, at: now() };
-    if (!fire(buyBtn)) { S.shopPending = null; return; }
+    S.shopPending = { id: pick.id, money: save.money || 0, at: now() };
+    if (!fire(found.buyBtn)) { S.shopPending = null; return; }
 
     /* 有些商品会弹二次确认：脚本的弹窗托管默认不点「购买」，这里自己点一次 */
     setTimeout(() => {
@@ -3407,7 +3455,7 @@
       if (ok) { fire(ok); log('item', '已确认购买弹窗'); }
     }, 700);
 
-    /* 价格从商店行上读不准（÷10、Max 档），3 秒后按金钱差额结账 */
+    /* 价格从行上读不准（Max 档、折扣），3 秒后按金钱差额结账 */
     setTimeout(settleShop, 3000);
   }
 
@@ -3419,23 +3467,25 @@
     if (!save) return;
     const spent = (pend.money || 0) - (save.money || 0);
     if (spent > 0) {
-      log('item', `补货 ${pend.id} −${fmt(spent)} ₽（余 ${fmt(save.money)} ₽）`);
+      log('item', `采购 ${pend.id} −${fmt(spent)} ₽（余 ${fmt(save.money)} ₽）`);
       ledgerAdd({ bought: 1 });
     } else {
-      log('warn', `补货 ${pend.id} 似乎没成交（金钱没变），稍后重试`);
+      log('warn', `采购 ${pend.id} 似乎没成交（金钱没变），稍后重试`);
     }
   }
 
   /** 「商店探测」：游戏改版换了 class 时，靠这条日志就能看出卡在哪一步 */
   function shopDiag() {
     const rows = $$('#shop-grid .sh-item');
+    const plan = shopPlan(S.save || {}, S.cfg);
     const info = {
       商店页: shopScreenOpen(),
       商品行: rows.length,
-      前几行: rows.slice(0, 12).map((r) => (r.dataset.id || '?') + (r.classList.contains('locked') ? '(锁)' : '')),
-      有购买按钮: rows.length ? !!rows[0].querySelector('.sh-buy button.buy') : null,
+      货架: rows.slice(0, 12).map((r) => (r.dataset.id || '?') + (r.classList.contains('locked') ? '(锁)' : '')),
+      有购买按钮: rows.length ? !!rows[0].querySelector('.sh-buy button.buy, .sh-bottom button.buy') : null,
       金钱: (S.save && S.save.money) || 0,
-      待补: shopPlan(S.save || {}, S.cfg).map((p) => `${p.id}×${p.need}`),
+      今日已花: ledgerToday().spent || 0,
+      能否采购: plan.ok ? plan.picks.map((p) => `${p.id}@${p.price}`) : plan.reason,
     };
     const text = JSON.stringify(info);
     log('info', '商店探测：' + text.slice(0, 300));
@@ -3444,7 +3494,7 @@
 
   /* ====================== 模块：收益账本（按日） ====================== */
   /* 只记「相邻两次采样的正增量」，花钱记到 spent；一份账本一天一条，
-     既能看今天赚了多少，也能看出补货/游戏城吃掉了多少。 */
+     既能看今天赚了多少，也能看出采购/游戏城吃掉了多少。 */
   const LEDGER_KEY = 'pcauto.ledger.v2';
   const LEDGER_KEEP_DAYS = 90;
 
@@ -3530,7 +3580,7 @@
     const d = ledgerData();
     const keys = Object.keys(d.days).sort();
     if (!keys.length) { log('warn', '账本还是空的，多挂一会儿再来导出'); return; }
-    const head = ['日期', '收入₽', '支出₽', '捕获', '战斗', '进化', '孵化', '补货次数', '在线小时', '收入/时'];
+    const head = ['日期', '收入₽', '支出₽', '捕获', '战斗', '进化', '孵化', '采购次数', '在线小时', '收入/时'];
     const rows = keys.map((k) => {
       const v = d.days[k];
       const h = (v.ms || 0) / 3600000;

@@ -89,7 +89,10 @@ function makeEnv(opts = {}) {
     lsGet: (k) => (store.has(k) ? store.get(k) : null),
     lsSet: (k, v) => { store.set(k, v); return true; },
     safeParse: (raw, fb) => { try { const v = JSON.parse(raw); return v == null ? fb : v; } catch { return fb; } },
-    document: { querySelector: () => null, querySelectorAll: () => [] },
+    document: {
+      querySelector: () => null, querySelectorAll: () => [],
+      createElement: (tag) => ({ tagName: tag, style: {}, className: '', id: '', textContent: '', title: '', onclick: null, remove() { this.removed = true; } }),
+    },
     fire: (el) => { fired.push(el); return true; },
     log: (kind, msg) => { logs.push(`[${kind}] ${msg}`); },
     notify: () => {},
@@ -124,7 +127,8 @@ function makeEnv(opts = {}) {
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
-             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount };`);
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount,
+             evoParseItemId, evoItemSlots, evoNeedsBuy, evoInject, evoItemCn };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -652,6 +656,66 @@ function rebuild(env, body) {
   eq(api.lvBurstCount(159000, 600, 0, 10), 0, '没货就不点');
 }
 
+
+/* ---------------- 进化素材按钮（3.9.5） ---------------- */
+{
+  const env = makeEnv();
+  const api = env.api;
+
+  eq(api.evoParseItemId('assets/items/leaf-stone.png'), 'leaf-stone', '从图标地址取道具 id');
+  eq(api.evoParseItemId('/assets/items/exp-candy-xl.png'), 'exp-candy-xl', '带前缀也能取');
+  eq(api.evoParseItemId('assets/ui/link-cable.svg'), 'link-cable', '联系绳是 ui 资源');
+  eq(api.evoParseItemId('assets/pokemon/25.png'), null, '精灵头像不算道具');
+  eq(api.evoItemCn('leaf-stone'), '叶之石', '道具中文名');
+  eq(api.evoItemCn('unknown-thing'), 'unknown-thing', '没收录就退回 id');
+
+  // 用户真实贴来的那颗按钮：title 被游戏换成了「已拥有大食花」，style 是 span 6
+  const realBtn = (title, cnt, grid) => {
+    const b = {
+      disabled: true, afterEl: null, className: 'btn small gold',
+      style: { gridColumn: grid || 'span 6' },
+      querySelector: (sel) => (sel === 'img' ? { getAttribute: () => 'assets/items/leaf-stone.png' }
+        : sel === 'small' ? { textContent: 'x' + cnt } : null),
+      getAttribute: (k) => (k === 'title' ? title : null),
+      after: (el) => { b.afterEl = el; },
+    };
+    b.parentNode = { querySelector: () => null };
+    return b;
+  };
+  const modal = (btns) => ({ querySelectorAll: () => btns, querySelector: () => null });
+
+  const slots = api.evoItemSlots(modal([realBtn('已拥有大食花', 0)]));
+  eq(slots.length, 1, '认得出带道具图标的按钮');
+  eq(slots[0].id, 'leaf-stone', '道具是叶之石');
+  eq(slots[0].count, 0, '持有 0 个');
+  eq(slots[0].blocked, true, 'title 没有「→」= 游戏不让进化');
+  eq(slots[0].name, '叶之石', '名字退回道具中文名');
+  eq(slots[0].grid, 'span 6', '记住兄弟按钮的网格跨度');
+  eq(api.evoNeedsBuy(slots).length, 1, 'x0 就该给它挂按钮');
+
+  const normalSlots = api.evoItemSlots(modal([realBtn('叶之石 → 大食花 (x0)', 0, 'span 3')]));
+  eq(normalSlots[0].blocked, false, '正常 title 不算被拦');
+  eq(normalSlots[0].name, '叶之石', '名字取箭头前');
+
+  const have = api.evoItemSlots(modal([realBtn('叶之石 → 大食花 (x2)', 2)]));
+  eq(have[0].count, 2, '有货的读得到数量');
+  eq(api.evoNeedsBuy(have).length, 0, '有货的不该挂');
+
+  // 注入：class 跟兄弟一致、网格跨度照抄，否则在 6 列网格里会被挤成一条缝
+  const b1 = realBtn('叶之石 → 大食花 (x0)', 0, 'span 6');
+  api.evoInject(modal([b1]));
+  ok(!!b1.afterEl, 'x0 的按钮后面挂了按钮');
+  eq(b1.afterEl.id, 'pcauto-evobuy-leaf-stone', 'id 带道具名，重复注入不会叠');
+  eq(b1.afterEl.style.gridColumn, 'span 6', '网格跨度跟兄弟一致');
+  ok(/btn small gold/.test(b1.afterEl.className), 'class 跟兄弟一致');
+  eq(b1.afterEl.textContent, '买素材·叶之石', '正常情况写「买素材」');
+
+  const b2 = realBtn('已拥有大食花', 0);
+  api.evoInject(modal([b2]));
+  eq(b2.afterEl.textContent, '素材·叶之石', '被游戏拦住的写成「素材」而不是「买素材」');
+  ok(/买了也用不上/.test(b2.afterEl.title), 'title 说清为什么买了没用');
+}
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${pass} 项`);
@@ -660,4 +724,4 @@ if (fails.length) {
   fails.forEach((f) => console.log('  ✗ ' + f));
   process.exit(1);
 }
-console.log('✅ 3.7 / 3.8 新增逻辑全部通过');
+console.log('✅ 3.7 – 3.9.5 新增逻辑全部通过');

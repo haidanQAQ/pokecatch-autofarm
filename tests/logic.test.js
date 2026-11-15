@@ -89,10 +89,7 @@ function makeEnv(opts = {}) {
     lsGet: (k) => (store.has(k) ? store.get(k) : null),
     lsSet: (k, v) => { store.set(k, v); return true; },
     safeParse: (raw, fb) => { try { const v = JSON.parse(raw); return v == null ? fb : v; } catch { return fb; } },
-    document: {
-      querySelector: () => null, querySelectorAll: () => [],
-      createElement: (tag) => ({ tagName: tag, style: {}, className: '', id: '', textContent: '', onclick: null, remove() { this.removed = true; } }),
-    },
+    document: { querySelector: () => null, querySelectorAll: () => [] },
     fire: (el) => { fired.push(el); return true; },
     log: (kind, msg) => { logs.push(`[${kind}] ${msg}`); },
     notify: () => {},
@@ -127,8 +124,7 @@ function makeEnv(opts = {}) {
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
-             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount,
-             evoParseItemId, evoItemSlots, evoNeedsBuy, evoInject, evoItemCn };`);
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -656,59 +652,6 @@ function rebuild(env, body) {
   eq(api.lvBurstCount(159000, 600, 0, 10), 0, '没货就不点');
 }
 
-
-/* ---------------- 进化素材按钮（3.9.4） ---------------- */
-{
-  const env = makeEnv();
-  const api = env.api;
-
-  eq(api.evoParseItemId('assets/items/moon-stone.png'), 'moon-stone', '从图标地址取道具 id');
-  eq(api.evoParseItemId('/assets/items/exp-candy-xl.png'), 'exp-candy-xl', '带前缀也能取');
-  eq(api.evoParseItemId('assets/ui/link-cable.svg'), 'link-cable', '联系绳是 ui 资源');
-  eq(api.evoParseItemId('assets/pokemon/25.png'), null, '精灵头像不算道具');
-  eq(api.evoParseItemId(''), null, '空地址返回 null');
-  eq(api.evoItemCn('moon-stone'), '月之石', '道具中文名');
-  eq(api.evoItemCn('unknown-thing'), 'unknown-thing', '没收录就退回 id');
-
-  const mkBtn = (src, cnt, dis, title) => {
-    const b = {
-      disabled: !!dis, afterEl: null,
-      querySelector: (sel) => (sel === 'img' ? { getAttribute: () => src } : sel === 'small' ? { textContent: 'x' + cnt } : null),
-      getAttribute: (k) => (k === 'title' ? (title || '') : null),
-      after: (el) => { b.afterEl = el; },
-    };
-    b.parentNode = { querySelector: () => null };
-    return b;
-  };
-  const modal = (btns) => ({ querySelectorAll: () => btns, querySelector: () => null });
-
-  const slots = api.evoItemSlots(modal([
-    mkBtn('assets/items/moon-stone.png', 0, true, '月之石 → 皮可西 (x0)'),
-    mkBtn('assets/items/thunder-stone.png', 2, false, '雷之石 → 雷丘 (x2)'),
-    mkBtn('assets/pokemon/25.png', 0, true, ''),
-  ]));
-  eq(slots.length, 2, '只认带道具图标的按钮');
-  eq(slots[0].id, 'moon-stone', '第一件是月之石');
-  eq(slots[0].count, 0, '持有 0 个');
-  eq(slots[0].disabled, true, '游戏把它点灰了');
-  eq(slots[0].name, '月之石', '名字取自 title 箭头前');
-  eq(slots[1].count, 2, '雷之石有 2 个');
-  eq(slots[1].disabled, false, '有货就能点');
-  eq(api.evoItemSlots(null).length, 0, '弹窗不在就返回空');
-
-  eq(api.evoNeedsBuy(slots).length, 1, '只有 x0 的那件需要买');
-  eq(api.evoNeedsBuy(slots)[0].id, 'moon-stone', '要买的是月之石');
-  eq(api.evoNeedsBuy([]).length, 0, '没有进化按钮就什么都不做');
-
-  const b1 = mkBtn('assets/items/dragon-scale.png', 0, true, '龙之鳞片 → 刺龙王 (x0)');
-  const b2 = mkBtn('assets/items/up-grade.png', 1, false, '升级数据 → 多边兽2 (x1)');
-  api.evoInject(modal([b1, b2]));
-  ok(!!b1.afterEl, 'x0 的按钮后面挂了「买素材」');
-  eq(b1.afterEl.textContent, '买素材·龙之鳞片', '按钮上写明买什么');
-  eq(b1.afterEl.id, 'pcauto-evobuy-dragon-scale', 'id 带道具名，重复注入不会叠');
-  eq(b2.afterEl, null, '有货的那件不挂');
-}
-
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${pass} 项`);
@@ -717,4 +660,4 @@ if (fails.length) {
   fails.forEach((f) => console.log('  ✗ ' + f));
   process.exit(1);
 }
-console.log('✅ 3.7 – 3.9.4 新增逻辑全部通过');
+console.log('✅ 3.7 / 3.8 新增逻辑全部通过');

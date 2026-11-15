@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.9.4
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9 详情界面「升到下一级」（先算再吃、按档位拆分、批量连点）；3.9.4 新增「买素材」按钮：道具进化的宝可梦就地买素材并进化
+// @version      3.9.3
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9.3 「升到下一级」改为批量连点喂糖与 ×10 下单，整体快一个数量级
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.9.4';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.9.3';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -4509,131 +4509,11 @@
     return lv > startLv ? `买完批量喂了 ${r.fed} 颗，升到 Lv.${lv}` : (r.fed ? `买完喂了 ${r.fed} 颗，当前 Lv.${lv}` : null);
   }
 
-  /* ---------- 进化素材（道具进化的一只，就地买、就地进化） ---------- */
-  const EVO_ITEM_CN = {
-    'fire-stone': '火之石', 'water-stone': '水之石', 'thunder-stone': '雷之石', 'leaf-stone': '叶之石',
-    'moon-stone': '月之石', 'sun-stone': '日之石', 'shiny-stone': '光之石', 'dusk-stone': '暗之石',
-    'dawn-stone': '觉醒之石', 'ice-stone': '冰之石', 'oval-stone': '浑圆之石',
-    'soothe-bell': '安抚之铃', 'kings-rock': '王者之证', 'metal-coat': '金属外套', 'dragon-scale': '龙之鳞片',
-    'up-grade': '升级数据', 'prism-scale': '美丽鳞片', 'deep-sea-tooth': '深海之牙', 'deep-sea-scale': '深海之鳞',
-    'protector': '护具', 'electirizer': '电力增幅器', 'magmarizer': '熔岩增幅器', 'reaper-cloth': '灵界之布',
-    'razor-claw': '锐利之爪', 'razor-fang': '锐利之牙', 'shed-shell': '脱壳', 'link-cable': '联系绳',
-  };
-
-  function evoParseItemId(src) {
-    const s = String(src || '');
-    if (/assets\/ui\/link-cable\.svg/.test(s)) return 'link-cable';
-    const m = s.match(/assets\/items\/([a-z0-9-]+)\.png/i);
-    return m ? m[1] : null;
-  }
-
-  const evoItemCn = (id) => EVO_ITEM_CN[id] || id;
-
-  // 详情弹窗里「用道具进化」的按钮：img 是道具图标，<small>x{n}</small> 是持有数
-  // 持有数为 0 时游戏会把按钮 disable 掉 —— 那正是需要「买素材」的时候
-  function evoItemSlots(m) {
-    const out = [];
-    if (!m || !m.querySelectorAll) return out;
-    for (const btn of m.querySelectorAll('button')) {
-      const img = btn.querySelector && btn.querySelector('img');
-      if (!img) continue;
-      const id = evoParseItemId(img.getAttribute && img.getAttribute('src'));
-      if (!id) continue;
-      const small = btn.querySelector('small');
-      const cnt = lvParseNum(String((small && small.textContent) || '').replace(/^[x×]/i, ''));
-      if (cnt == null) continue;
-      const title = (btn.getAttribute && btn.getAttribute('title')) || '';
-      const cut = title.indexOf('→');
-      const name = cut > 0 ? title.slice(0, cut).trim() : evoItemCn(id);
-      out.push({ btn: btn, id: id, count: cnt, disabled: !!btn.disabled, name: name, title: title });
-    }
-    return out;
-  }
-
-  function evoBadgeInto(slot) {
-    if (!slot || !slot.btn || !slot.btn.parentNode) return;
-    const bid = 'pcauto-evobuy-' + slot.id;
-    const parent = slot.btn.parentNode;
-    if (parent.querySelector('#' + bid)) return;
-    const btn = document.createElement('button');
-    btn.id = bid;
-    btn.className = 'btn small';
-    btn.title = `买 1 个${slot.name}（${evoItemCn(slot.id)}），买完直接回来进化`;
-    btn.style.cssText = 'border-color:#3f7bd6;color:#cfe0ff';
-    btn.textContent = `买素材·${slot.name}`;
-    btn.onclick = (ev) => {
-      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
-      evoBuyAndEvolve(slot.id).then((r) => { if (r) log('info', r); }).catch(() => { });
-    };
-    slot.btn.after(btn);
-  }
-
-  // 哪些进化按钮该配一个「买素材」：持有数为 0 的才需要
-  function evoNeedsBuy(slots) {
-    return (slots || []).filter((s) => s && s.count <= 0);
-  }
-
-  function evoInject(m) {
-    const slots = evoItemSlots(m);
-    for (const s of slots) {
-      if (s.count > 0) {
-        const old = m.querySelector('#pcauto-evobuy-' + s.id);
-        if (old) old.remove();      // 已经买到了，按钮就该消失
-      }
-    }
-    for (const s of evoNeedsBuy(slots)) evoBadgeInto(s);
-  }
-
-  // 买素材 → 回队伍 → 重开这只的详情 → 点它自己的进化按钮
-  async function evoBuyAndEvolve(itemId) {
-    if (S.evoBusy) return '正在买素材…';
-    const money0 = Number((S.save || {}).money || 0);
-    const floor = Number(S.cfg.shopMoneyFloor || 0);
-    if (money0 <= floor) return `金钱 ${money0.toLocaleString()} ₽ 已低于保留线 ${floor.toLocaleString()} ₽，不自动买素材`;
-    S.evoBusy = true;
-    try {
-      const r = await lvBuyFast([{ id: itemId, qty: 1 }]);
-      if (!r.ok) {
-        return `买不到${evoItemCn(itemId)}：${r.reason || '商店没这件货'}（只能靠野外掉落 / 活动）`;
-      }
-      const m = await lvReopen();
-      if (!m) return `已买到${evoItemCn(itemId)}，但没回到那只宝可梦的详情，请点开它再按一次进化`;
-      const target = evoItemSlots(m).find((s) => s.id === itemId && s.count > 0 && !s.disabled);
-      if (!target) return `已买到${evoItemCn(itemId)}，但进化按钮还是灰的（可能已经拥有进化后的图鉴）`;
-      lvFire(target.btn);
-      await lvWait(900);
-      const now = Number((S.save || {}).money || 0);
-      const spent = money0 - now;
-      return `已买${evoItemCn(itemId)}并点了进化${spent > 0 ? `（花 ${spent.toLocaleString()} ₽）` : ''}，看下特效有没有放完`;
-    } catch (e) {
-      return '买素材出错：' + ((e && e.message) || e);
-    } finally {
-      S.evoBusy = false;
-      S.lastActivityAt = now();
-    }
-  }
-
-  // 回队伍、按记下的序号重开详情
-  async function lvReopen() {
-    const slotIdx = S.lvSlot;
-    lvGoto('team');
-    await lvPollUntil(() => !!document.querySelector('#team-slots .slot.filled'), 1500, 40);
-    const slots = [...document.querySelectorAll('#team-slots .slot.filled')];
-    const slot = slotIdx != null ? slots[slotIdx] : slots[0];
-    if (!slot) return null;
-    lvFire(slot);
-    await lvPollUntil(() => !!lvModal(), 1200, 40);
-    const m = lvModal();
-    if (m) { lvButtonInto(m); evoInject(m); }
-    return m;
-  }
-
   // 每拍检查：详情弹窗开着就把按钮挂上去（弹窗升级后会重绘，所以要反复补）
   function lvTick() {
     const m = lvModal();
     if (!m) return;
     lvButtonInto(m);
-    evoInject(m);      // 需要素材才能进化的，就地给一个「买素材」按钮
   }
 
   /* ====================== 主循环 ====================== */
@@ -4724,7 +4604,7 @@
     if (!S.awaySnap) { S.awaySnap = tallySnap(); S.awayLastSeen = now(); }
 
     // 挂到页面的 window 上，控制台里才能访问
-    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed, lvCoverPlan, lvOwnedXp, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount, lvFeedFast, lvBuyFast, evoParseItemId, evoItemSlots, evoBuyAndEvolve, lvReopen, evoNeedsBuy }; } catch { /* 忽略 */ }
+    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed, lvCoverPlan, lvOwnedXp, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount, lvFeedFast, lvBuyFast }; } catch { /* 忽略 */ }
     ensureRealDescs();   // 先存下原始描述符，之后无论保活开没开，isRealHidden() 都能读到真值
     startGradeWatcher();
     safeInterval('tick', tick, TICK_MS);

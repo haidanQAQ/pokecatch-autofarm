@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.6.0
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送
+// @version      3.7.0
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增商店自动补货、每日收益账本、图鉴缺口、培育屋监控
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.6.0';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.7.0';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -105,6 +105,18 @@
     pushType: 'ntfy',        // bark / ntfy / telegram
     pushOnlyAway: true,      // 只在您不在电脑前时推送（标签页在后台，或 5 分钟没操作）
     pushEvents: { shiny: true, event: true, stall: true, manual: true, badge: false, death: false },
+    // 商店自动补货（把「自动吃树果」的增益链接上，别让它断供）
+    autoShop: false,
+    shopKeepBerries: 3,       // 每种已启用的增益树果补到几颗
+    shopKeepCandy: 0,         // 经验糖补到几颗（0 = 不补）
+    shopMoneyFloor: 20000,    // 金钱低于此值一律不买
+    shopDailyCap: 300000,     // 每天补货最多花多少 ₽（0 = 不限）
+    shopEveryMin: 10,         // 补货检查间隔（分钟）
+    // 数据分析
+    daycareWatch: true,       // 培育屋监控（蛋位 / 孵化 / 闪光亲代提示）
+    ledger: true,             // 每日产出账本
+    dailyReport: true,        // 每天推一次「昨日战报 + 图鉴缺口」
+    dailyReportHour: 8,       // 几点推
   };
 
   const SAFE_EXACT = [
@@ -2872,6 +2884,11 @@
       ${row('捕获 /时', `${fmt(S.rate.catch)}${S.avg.catch ? ` <span style="color:#6b7488;font-weight:400">均 ${fmt(S.avg.catch)}</span>` : ''}`, '#8ee98e')}
       ${row('战斗 /时', `${fmt(S.rate.battle)}${S.avg.battle ? ` <span style="color:#6b7488;font-weight:400">均 ${fmt(S.avg.battle)}</span>` : ''}`)}
       ${row('金钱 /时', `₽ ${fmt(S.rate.money)}${S.avg.money ? ` <span style="color:#6b7488;font-weight:400">均 ${fmt(S.avg.money)}</span>` : ''}`, '#ffcb05')}
+      ${S.cfg.ledger ? (() => {
+      const ld = ledgerTodayCached();
+      const px = ld.spent > 0 ? ` <span style="color:#6b7488;font-weight:400">−${fmt(ld.spent)}</span>` : '';
+      return row('今日', `+₽ ${fmt(ld.money)}${px} · 捕 ${fmt(ld.caught)}`, '#8ee98e');
+    })() : ''}
       ${sep}
       ${(() => {
       const bfs = buffState(S.save || {});
@@ -3012,6 +3029,28 @@
       ${group('多玩法')}
       ${chk('casinoAuto', '游戏城：进入后自动挂老虎机（消耗金钱）')}
       ${num('casinoFloor', '金钱低于多少 ₽ 停手', 0, 100000000, 1000)}
+
+      ${group('商店自动补货（增益续航）')}
+      ${chk('autoShop', '按需补树果 / 糖果（需要商店页开着）')}
+      ${num('shopKeepBerries', '每种增益树果补到几颗', 0, 99, 1)}
+      ${num('shopKeepCandy', '经验糖补到几颗（0 = 不补）', 0, 99, 1)}
+      ${num('shopMoneyFloor', '金钱低于多少 ₽ 不买', 0, 100000000, 1000)}
+      ${num('shopDailyCap', '每天最多花多少 ₽（0 = 不限）', 0, 100000000, 1000)}
+      ${num('shopEveryMin', '补货检查间隔（分钟）', 1, 240, 1)}
+      <div style="display:flex;gap:6px;padding:4px 0">
+        <button id="pcauto-shop-now" style="${smallBtn}">立即补货一次</button>
+        <button id="pcauto-shop-diag" style="${smallBtn}">商店探测</button>
+      </div>
+
+      ${group('数据与战报')}
+      ${chk('daycareWatch', '培育屋监控（蛋位 / 闪光亲代提示）')}
+      ${chk('ledger', '记录每日产出账本')}
+      ${chk('dailyReport', '每天推一次「昨日战报 + 图鉴缺口」')}
+      ${num('dailyReportHour', '几点推（0-23）', 0, 23, 1)}
+      <div style="display:flex;gap:6px;padding:4px 0">
+        <button id="pcauto-ledger-csv" style="${smallBtn}">导出账本 CSV</button>
+        <button id="pcauto-dexgap" style="${smallBtn}">图鉴缺口</button>
+      </div>
 
       ${group('界面增强')}
       ${chk('showGrades', '队伍 / PC 显示 S/A/B/C 评分角标')}
@@ -3226,6 +3265,16 @@
       const r = await feedAllCandy();
       log('item', '喂糖结果：' + r);
     };
+    /* ---- 补货 / 账本 / 图鉴 ---- */
+    const shopNowBtn = $('#pcauto-shop-now', box);
+    if (shopNowBtn) shopNowBtn.onclick = () => { box.remove(); S.shopAt = 0; autoShop(true); };
+    const shopDiagBtn = $('#pcauto-shop-diag', box);
+    if (shopDiagBtn) shopDiagBtn.onclick = () => shopDiag();
+    const csvBtn = $('#pcauto-ledger-csv', box);
+    if (csvBtn) csvBtn.onclick = () => ledgerCsv();
+    const gapBtn = $('#pcauto-dexgap', box);
+    if (gapBtn) gapBtn.onclick = () => showDexGap();
+
     $('#pcauto-close', box).onclick = () => box.remove();
     $('#pcauto-reset', box).onclick = () => {
       S.cfg = defaultCfg();
@@ -3234,6 +3283,386 @@
       log('info', '已恢复默认设置');
     };
     box.onclick = (e) => { if (e.target === box) box.remove(); };
+  }
+
+  /* ====================== 模块：商店自动补货（增益续航） ====================== */
+
+  /* 商店行结构（bundle 内 sh-item 模板，2026-11 版）：
+       <div class="sh-item" data-id="razz-berry">
+         <div class="sh-ic">…<span class="have">×12</span></div>
+         <div class="sh-name"><h4>树果名</h4><small>效果</small></div>
+         <div class="sh-buy">
+           <div class="seg"><button data-n="1" class="on">×1</button><button data-n="10">×10</button><button data-n="max">Max</button></div>
+           <button class="btn primary buy">Acheter</button>
+         </div>
+       </div>
+     未解锁的行带 .locked，行内会有 .sh-lock（差徽章）或 .sh-find（还没在途中找到过）；
+     买不起时按钮直接 disabled。所有点击都走 fire()，和脚本其它模块一条路。 */
+
+  const SHOP_BERRY_IDS = ['starf-berry', 'enigma-berry', 'nanab-berry', 'golden-razz-berry', 'razz-berry', 'pinap-berry', 'lansat-berry'];
+  const SHOP_CANDY_IDS = ['exp-candy-xl', 'exp-candy-big', 'exp-candy-m', 'exp-candy-s'];
+
+  /** 补货清单：只补「你已经在吃」的东西，不把存款花在没启用的 family 上 */
+  function shopPlan(save, cfg) {
+    const items = (save && save.items) || {};
+    const fams = cfg.berryFamilies || {};
+    const keepBerry = clamp(cfg.shopKeepBerries | 0, 0, 99);
+    const keepCandy = clamp(cfg.shopKeepCandy | 0, 0, 99);
+    const out = [];
+    if (keepBerry > 0) {
+      for (const id of SHOP_BERRY_IDS) {
+        const meta = BERRY_BUFFS[id];
+        if (!meta || fams[meta.family] === false) continue;
+        const have = items[id] || 0;
+        if (have < keepBerry) out.push({ id, need: keepBerry - have, label: `${meta.label}×${meta.mult}` });
+      }
+    }
+    if (keepCandy > 0) {
+      const id = SHOP_CANDY_IDS.find((c) => (items[c] || 0) < keepCandy);
+      if (id) out.push({ id, need: keepCandy - (items[id] || 0), label: id });
+    }
+    return out;
+  }
+
+  function shopScreenOpen() { return !!document.querySelector('#shop-grid'); }
+
+  /** 商店没开时，点一下地图「附近」列表里的商店入口；点不到就只在日志里提醒一次 */
+  function tryOpenShop() {
+    const go = document.querySelector('[data-go="shop"]');
+    if (go && go.offsetParent !== null) { fire(go); return true; }
+    return false;
+  }
+
+  /**
+   * @param force 设置面板的「立即补货一次」会跳过冷却
+   */
+  function autoShop(force = false) {
+    if (!S.cfg.autoShop && !force) return;
+    const save = S.save;
+    if (!save) return;
+    if (!force) {
+      const every = Math.max(1, S.cfg.shopEveryMin | 0) * 60000;
+      if (now() - (S.shopAt || 0) < every) return;
+    }
+    if (userBusy(2500)) return;
+    if (S.shopBusy && now() - S.shopBusy < 4000) return;      // 上一次点击还在结算
+    if (isRealHidden() && !S.keepAliveOn) return;
+
+    const floor = Math.max(0, S.cfg.shopMoneyFloor | 0);
+    const money = save.money || 0;
+    if (money <= floor) { S.shopAt = now(); return; }          // 余额保护
+
+    const plan = shopPlan(save, S.cfg);
+    if (!plan.length) { S.shopAt = now(); return; }
+
+    const cap = Math.max(0, S.cfg.shopDailyCap | 0);
+    if (cap > 0 && ledgerToday().spent >= cap) {
+      if (!S.shopCapWarnAt || now() - S.shopCapWarnAt > 3600000) {
+        S.shopCapWarnAt = now();
+        log('warn', `今日补货已花 ${fmt(ledgerToday().spent)} ₽，到日上限，暂停到今天结束`);
+      }
+      S.shopAt = now();
+      return;
+    }
+
+    if (!shopScreenOpen()) {
+      if (now() - (S.shopOpenTriedAt || 0) > 60000) {
+        S.shopOpenTriedAt = now();
+        if (tryOpenShop()) return;                             // 下个 tick 再看结果
+      }
+      if (now() - (S.shopHintAt || 0) > 600000) {
+        S.shopHintAt = now();
+        log('info', '补货待命：需要商店页（Boutique）开着，脚本才能下单');
+      }
+      S.shopAt = now();
+      return;
+    }
+
+    /* 玩家自己切到「卖」的时候不要抢 */
+    const buyTab = document.querySelector('#screen-shop [data-sh-mode="buy"]');
+    if (buyTab && !buyTab.classList.contains('on')) { fire(buyTab); S.shopAt = now(); return; }
+
+    const want = plan[0];
+    const sel = `#shop-grid .sh-item[data-id="${want.id}"]`;
+    const row = document.querySelector(sel);
+    if (!row) {
+      if (now() - (S.shopMissAt || 0) > 600000) {
+        S.shopMissAt = now();
+        log('info', `商店里没有 ${want.id}（徽章不够或还没在途中找到过），本轮跳过`);
+      }
+      S.shopAt = now();
+      return;
+    }
+    if (row.classList.contains('locked') || row.querySelector('.sh-lock, .sh-find')) { S.shopAt = now(); return; }
+
+    const buyBtn = row.querySelector('.sh-buy button.buy');
+    if (!buyBtn || buyBtn.disabled) { S.shopAt = now(); return; }
+
+    /* 数量档位：默认 ×1 最省，缺口大也一单一颗地补，避免一次买空余额 */
+    const segs = [...row.querySelectorAll('.sh-buy .seg button')];
+    if (segs.length && !segs.some((b) => b.classList.contains('on'))) fire(segs[0]);
+
+    S.shopBusy = now();
+    S.shopAt = now();
+    S.shopPending = { id: want.id, money, at: now() };
+    if (!fire(buyBtn)) { S.shopPending = null; return; }
+
+    /* 有些商品会弹二次确认：脚本的弹窗托管默认不点「购买」，这里自己点一次 */
+    setTimeout(() => {
+      const modal = document.querySelector('.modal');
+      if (!modal) return;
+      const ok = [...modal.querySelectorAll('button')]
+          .find((b) => !b.disabled && /购买|买下|Acheter|Buy/i.test(b.textContent || ''));
+      if (ok) { fire(ok); log('item', '已确认购买弹窗'); }
+    }, 700);
+
+    /* 价格从商店行上读不准（÷10、Max 档），3 秒后按金钱差额结账 */
+    setTimeout(settleShop, 3000);
+  }
+
+  function settleShop() {
+    const pend = S.shopPending;
+    S.shopPending = null;
+    if (!pend) return;
+    const save = readSave() || S.save;
+    if (!save) return;
+    const spent = (pend.money || 0) - (save.money || 0);
+    if (spent > 0) {
+      log('item', `补货 ${pend.id} −${fmt(spent)} ₽（余 ${fmt(save.money)} ₽）`);
+      ledgerAdd({ bought: 1 });
+    } else {
+      log('warn', `补货 ${pend.id} 似乎没成交（金钱没变），稍后重试`);
+    }
+  }
+
+  /** 「商店探测」：游戏改版换了 class 时，靠这条日志就能看出卡在哪一步 */
+  function shopDiag() {
+    const rows = $$('#shop-grid .sh-item');
+    const info = {
+      商店页: shopScreenOpen(),
+      商品行: rows.length,
+      前几行: rows.slice(0, 12).map((r) => (r.dataset.id || '?') + (r.classList.contains('locked') ? '(锁)' : '')),
+      有购买按钮: rows.length ? !!rows[0].querySelector('.sh-buy button.buy') : null,
+      金钱: (S.save && S.save.money) || 0,
+      待补: shopPlan(S.save || {}, S.cfg).map((p) => `${p.id}×${p.need}`),
+    };
+    const text = JSON.stringify(info);
+    log('info', '商店探测：' + text.slice(0, 300));
+    try { navigator.clipboard?.writeText(text); } catch { /* 忽略 */ }
+  }
+
+  /* ====================== 模块：收益账本（按日） ====================== */
+  /* 只记「相邻两次采样的正增量」，花钱记到 spent；一份账本一天一条，
+     既能看今天赚了多少，也能看出补货/游戏城吃掉了多少。 */
+  const LEDGER_KEY = 'pcauto.ledger.v2';
+  const LEDGER_KEEP_DAYS = 90;
+
+  function dayKey(ts = now()) {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  const NEW_DAY = () => ({ money: 0, spent: 0, caught: 0, battles: 0, evolutions: 0, hatched: 0, bought: 0, ms: 0 });
+
+  function ledgerData() {
+    const raw = safeParse(lsGet(LEDGER_KEY), null);
+    const d = raw && typeof raw === 'object' ? raw : {};
+    return { days: d.days && typeof d.days === 'object' ? d.days : {}, pushed: d.pushed || '' };
+  }
+
+  function ledgerSave(d) {
+    const keys = Object.keys(d.days).sort();
+    for (const k of keys.slice(0, Math.max(0, keys.length - LEDGER_KEEP_DAYS))) delete d.days[k];
+    lsSet(LEDGER_KEY, JSON.stringify({ days: d.days, pushed: d.pushed || '' }));
+  }
+
+  function ledgerToday() {
+    const d = ledgerData();
+    return d.days[dayKey()] || NEW_DAY();
+  }
+
+  /** HUD 每秒重绘，账本没必要每次重解析；10 秒内的结果直接复用 */
+  function ledgerTodayCached() {
+    if (S.ledgerCacheAt && now() - S.ledgerCacheAt < 10000) return S.ledgerCache;
+    S.ledgerCacheAt = now();
+    S.ledgerCache = ledgerToday();
+    return S.ledgerCache;
+  }
+
+  function ledgerAdd(delta, ts = now()) {
+    const d = ledgerData();
+    const k = dayKey(ts);
+    const day = d.days[k] || NEW_DAY();
+    for (const [f, v] of Object.entries(delta || {})) {
+      if (typeof v === 'number' && v) day[f] = (day[f] || 0) + v;
+    }
+    d.days[k] = day;
+    ledgerSave(d);
+    S.ledgerCacheAt = 0;
+    if (ts === now()) scheduleHud();
+    return day;
+  }
+
+  function ledgerTick() {
+    if (!S.cfg.ledger) return;
+    const save = S.save;
+    if (!save) return;
+    const st = save.stats || {};
+    const cur = {
+      money: save.money || 0,
+      caught: st.caught || 0,
+      battles: st.battles || 0,
+      evolutions: st.evolutions || 0,
+      hatched: st.hatched || 0,
+    };
+    const prev = S.ledgerPrev;
+    S.ledgerPrev = cur;
+    if (!prev) return;
+
+    const delta = {};
+    const up = (k) => Math.max(0, (cur[k] || 0) - (prev[k] || 0));
+    if (cur.money > prev.money) delta.money = cur.money - prev.money;
+    else if (cur.money < prev.money) delta.spent = prev.money - cur.money;
+    if (up('caught')) delta.caught = up('caught');
+    if (up('battles')) delta.battles = up('battles');
+    if (up('evolutions')) delta.evolutions = up('evolutions');
+    if (up('hatched')) delta.hatched = up('hatched');
+    /* 世界还在推进（战斗日志近 90 秒内动过）才累计在线时长，避免后台停摆把时间算进去 */
+    if (now() - (S.lastActivityAt || 0) < 90000) delta.ms = Math.min(15000, Math.max(0, now() - (S.ledgerAt || now())));
+    S.ledgerAt = now();
+    if (Object.keys(delta).length) ledgerAdd(delta);
+
+    maybeDailyReport();
+  }
+
+  function ledgerCsv() {
+    const d = ledgerData();
+    const keys = Object.keys(d.days).sort();
+    if (!keys.length) { log('warn', '账本还是空的，多挂一会儿再来导出'); return; }
+    const head = ['日期', '收入₽', '支出₽', '捕获', '战斗', '进化', '孵化', '补货次数', '在线小时', '收入/时'];
+    const rows = keys.map((k) => {
+      const v = d.days[k];
+      const h = (v.ms || 0) / 3600000;
+      return [k, v.money || 0, v.spent || 0, v.caught || 0, v.battles || 0, v.evolutions || 0, v.hatched || 0, v.bought || 0,
+        h.toFixed(2), h > 0 ? Math.round((v.money || 0) / h) : 0].join(',');
+    });
+    /* \ufeff：Excel 直接双击打开中文表头不乱码 */
+    downloadText(`pokecatch-ledger-${dayKey()}.csv`, '\ufeff' + [head.join(','), ...rows].join('\r\n'));
+    log('info', `账本已导出（${keys.length} 天）`);
+  }
+
+  /* ====================== 模块：图鉴缺口 ====================== */
+
+  const DEX_GENS = [
+    { key: 'kanto', name: '关都', from: 1, to: 151 },
+    { key: 'johto', name: '城都', from: 152, to: 251 },
+    { key: 'hoenn', name: '丰缘', from: 252, to: 386 },
+    { key: 'sinnoh', name: '神奥', from: 387, to: 493 },
+  ];
+
+  /** 用存档里的图鉴键（可能是 "25" 或 "25:form"）统计每个世代还差多少 */
+  function dexGap(save) {
+    const dex = (save && save.dex) || {};
+    const ids = new Set();
+    for (const k of Object.keys(dex)) {
+      const n = parseInt(String(k).split(/[^\d]/)[0], 10);
+      if (n > 0) ids.add(n);
+    }
+    const gens = DEX_GENS.map((g) => {
+      let have = 0;
+      for (let i = g.from; i <= g.to; i++) if (ids.has(i)) have++;
+      const need = g.to - g.from + 1;
+      return { ...g, have, need, left: need - have, pct: Math.round((have / need) * 100) };
+    });
+    /* 「当前地区」按已开最多的那一代算，缺得最少的那代通常是当前主战场 */
+    const started = gens.filter((g) => g.have > 0);
+    const current = started.length ? started[started.length - 1] : gens[0];
+    return { total: ids.size, gens, current, started };
+  }
+
+  function dexGapText(gap) {
+    const c = gap.current;
+    const parts = gap.gens.filter((g) => g.have > 0).map((g) => `${g.name} ${g.pct}%`);
+    return `${parts.join(' · ') || '还没有图鉴数据'}｜${c.name}还差 ${c.left} 只（${c.have}/${c.need}）`;
+  }
+
+  function showDexGap() {
+    const gap = dexGap(S.save || {});
+    log('info', '图鉴缺口：' + dexGapText(gap));
+    const detail = gap.gens.map((g) => `${g.name} ${g.have}/${g.need}（${g.pct}%，缺 ${g.left}）`).join('\n');
+    notify('📖 图鉴缺口', detail, 'pcauto-dexgap');
+  }
+
+  /* ====================== 模块：培育屋监控 ====================== */
+
+  function daycareState(save) {
+    const pen = (save && save.pension) || {};
+    const parents = (pen.mons || []).filter((p) => p && p.mon);
+    const shinyParents = parents.filter((p) => p.mon && p.mon.shiny).length;
+    return {
+      slots: parents.length,
+      eggs: (pen.eggs || []).length,
+      shinyParents,
+      /* 游戏原文：异色的父母有 1/10 的几率生下异色的蛋 */
+      shinyNote: shinyParents > 0 ? '闪光亲代在场，蛋有 1/10 概率是闪光' : '',
+    };
+  }
+
+  function daycareTick() {
+    if (!S.cfg.daycareWatch) return;
+    const save = S.save;
+    if (!save) return;
+    const st = daycareState(save);
+    const prev = S.penPrev;
+    S.penPrev = st;
+    if (!prev) return;
+
+    if (st.eggs > prev.eggs) {
+      log('item', `🥚 培育屋多了 ${st.eggs - prev.eggs} 颗蛋（共 ${st.eggs} 颗）`);
+      pushSend('event', '🥚 培育屋有新蛋', `当前 ${st.eggs} 颗${st.shinyNote ? ' · ' + st.shinyNote : ''}`);
+    }
+    if (st.slots > 0 && prev.slots === 0 && now() - (S.penHintAt || 0) > 1800000) {
+      S.penHintAt = now();
+      log('info', '培育屋已放入伙伴，开始累积蛋位');
+    }
+    if (st.slots === 0 && now() - (S.penEmptyAt || 0) > 1800000) {
+      S.penEmptyAt = now();
+      log('info', '培育屋还空着：放两只宝可梦能攒蛋（闪光亲代 1/10 出闪光蛋）');
+    }
+  }
+
+  /* ====================== 模块：每日战报（账本 + 图鉴缺口） ====================== */
+
+  function yesterdayKey() { return dayKey(now() - 86400000); }
+
+  function dailyReportText() {
+    const d = ledgerData();
+    const yk = yesterdayKey();
+    const y = d.days[yk];
+    const gap = dexGap(S.save || {});
+    const lines = [];
+    if (y) {
+      const h = Math.max(0.05, (y.ms || 0) / 3600000);
+      lines.push(`昨日 ${yk}：+${fmt(y.money)} ₽ · 捕获 ${fmt(y.caught)} · 孵化 ${fmt(y.hatched)} · 进化 ${fmt(y.evolutions)}`);
+      lines.push(`支出 ${fmt(y.spent)} ₽ · 在线 ${h.toFixed(1)}h · 均 ${fmt(y.money / h)} ₽/时`);
+    } else {
+      lines.push('昨日没有账本记录（那天可能没挂机）');
+    }
+    lines.push('图鉴：' + dexGapText(gap));
+    return lines.join('\n');
+  }
+
+  function maybeDailyReport() {
+    if (!S.cfg.dailyReport) return;
+    const today = dayKey();
+    const d = ledgerData();
+    if (d.pushed === today) return;
+    if (new Date().getHours() < clamp(S.cfg.dailyReportHour | 0, 0, 23)) return;
+    const text = dailyReportText();
+    d.pushed = today;
+    ledgerSave(d);
+    log('info', '每日战报：' + text.replace(/\n/g, ' ｜ '));
+    pushSend('event', "Poke'Catch 每日战报", text, true);
   }
 
   /* ====================== 主循环 ====================== */
@@ -3283,6 +3712,8 @@
         ensureSpeed();
         casinoAuto();
         autoBerry();
+        autoShop();
+        daycareTick();
         maybeEvolve();
         maybeSave();
       }
@@ -3325,6 +3756,7 @@
     safeInterval('wakeLock', requestWakeLock, 60000);
     safeInterval('backup', maybeBackup, 60000);
     safeInterval('tally', saveTally, 30000);
+    safeInterval('ledger', ledgerTick, 5000);
     // 首次备份等游戏读完档、跑出第一次采样之后再做
     setTimeout(() => { try { maybeBackup(); } catch { /* 忽略 */ } }, 20000);
 

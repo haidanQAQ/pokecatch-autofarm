@@ -123,7 +123,7 @@ function makeEnv(opts = {}) {
     return { shopPlan, autoShop, settleShop, shopDiag, ledgerTick, ledgerAdd, ledgerToday, ledgerData,
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
-             btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch };`);
+             btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -483,6 +483,26 @@ function mockShopDom(rows) {
     return { btLeadPick };`)(...names.map((k) => env[k]));
   eq(empty.btLeadPick(env.S.save), null, '没有敌人池就不推荐');
   eq(env.api.btLeadPick({ team: [{ uid: 1, id: 1 }] }), null, '只有一只也不用排');
+}
+
+/* ---------------- 12. 对位卡渲染 ---------------- */
+
+{
+  const env = makeEnv({ save: { adv: { chapter: 0, node: 0, nodes: [{ name: '一号路' }] } } });
+  eq(env.api.btHudHtml(), '', '没有战斗时不渲染对位卡');
+
+  env.S.battle = { active: true, me: { uid: 1, id: 1, level: 20, hpPct: 80 }, foe: { id: 2, level: 20, hpPct: 35 } };
+  const html = env.api.btHudHtml();
+  ok(html.includes('对位'), '对位卡有「对位」行');
+  ok(html.includes('胜率'), '对位卡有胜率行');
+  ok(html.includes('#1') && html.includes('#2'), '对位卡带双方名字');
+  ok(html.includes('80%') && html.includes('35%'), '对位卡带双方血量');
+
+  /* 赢了 3 场之后应出现本区战绩行 */
+  env.api.btRecord(true, { key: '0:0', name: '一号路', hpLoss: 10, ms: 2000 });
+  const html2 = env.api.btHudHtml();
+  ok(html2.includes('本区战绩'), '有战绩时显示本区战绩');
+  ok(html2.includes('1 战 1 胜'), '战绩数字正确');
 }
 
 /* ---------------- 汇总 ---------------- */

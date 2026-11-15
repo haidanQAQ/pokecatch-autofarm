@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.7.0
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增商店自动补货、每日收益账本、图鉴缺口、培育屋监控
+// @version      3.8.0
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增商店自动补货、每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.7.0';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.8.0';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -117,6 +117,13 @@
     ledger: true,             // 每日产出账本
     dailyReport: true,        // 每天推一次「昨日战报 + 图鉴缺口」
     dailyReportHour: 8,       // 几点推
+    // 战斗辅助（战斗本身全自动，选招/丢球/逃跑都由游戏决定，这里只做遥测 / 换人 / 复盘）
+    battlePanel: true,        // HUD 显示对位与胜率
+    battleSwitchSmart: false, // 劣势换人（按对位胜率挑最克制的替补，默认关：会和你抢操作）
+    battleSwitchWin: 25,      // 本场胜率低于该值就换人
+    battleAutoOrder: false,   // 自动把最佳对位拖到队首（实验：合成拖拽，游戏可能不认）
+    battleStats: true,        // 按区域记战绩
+    battleWarnStreak: 3,      // 同一区域连败几场提醒换区（0 = 不提醒）
   };
 
   const SAFE_EXACT = [
@@ -1536,6 +1543,10 @@
     pushAt: {},            // 每类推送上次发送时间
     pushTimes: [],         // 最近一小时的推送时间，用于总量限流
     pushErrAt: 0,
+    // 战斗辅助
+    battle: null,          // 最近一次 battleProbe()
+    btFight: null,         // 进行中的战斗：{at, hp0, hpLast, zone, zoneName, foeId, deaths0}
+    btWarnAt: 0,           // 上次连败提醒时间
   };
 
   function log(kind, msg) {
@@ -2604,45 +2615,6 @@
     if (S.deathStreak && now() - (S.deathWarnAt || 0) > 30 * 60000) S.deathStreak = 0;
   }
 
-  /* ====================== 模块：残血自动换人 ====================== */
-
-  /**
-   * 血条百分比。必须确认宽度确实是百分比单位：
-   * 若游戏换成 px 宽度（如 "0px"），parseFloat 会得到一个很小的数，
-   * 于是每只宝可梦都被当成残血，残血换人会每 4 秒抢一次操作。
-   */
-  function hpPct(row) {
-    const bar = row && row.querySelector('.tr-hp i');
-    const w = (bar && bar.style && bar.style.width) || '';
-    if (!/%\s*$/.test(w)) return 100;      // 读不到百分比 → 视为健康，宁可不换人
-    const v = parseFloat(w);
-    return Number.isFinite(v) ? clamp(v, 0, 100) : 100;
-  }
-
-  function autoSwitch() {
-    if (!S.cfg.autoSwitch) return;
-    if (userBusy(3000) || S.feeding) return;
-    if (now() - (S.switchAt || 0) < 4000) return;
-    const rail = document.querySelector('#team-rail');
-    if (!rail) return;
-    const rows = [...rail.querySelectorAll('.tr-row')];
-    if (rows.length < 2) return;
-    const acting = rail.querySelector('.tr-row.acting');
-    if (!acting) return;
-    const curHp = hpPct(acting);
-    if (curHp > (S.cfg.switchAtHp || 30)) return;          // 还没到危险线
-    // 找一个健康的替补
-    const bench = rows
-        .filter((r) => r !== acting)
-        .map((r) => ({ row: r, hp: hpPct(r) }))
-        .filter((x) => x.hp > 55)
-        .sort((a, b) => b.hp - a.hp)[0];
-    if (!bench) return;
-    S.switchAt = now();
-    fire(bench.row);
-    log('battle', `残血换人（${Math.round(curHp)}% → ${Math.round(bench.hp)}%）`);
-  }
-
   /* ====================== 模块：游戏城无人值守 ====================== */
 
   function casinoAuto() {
@@ -2909,6 +2881,7 @@
       return row('战力', `均级 ${t.avg} · 存活 ${t.alive}/${t.size}${t.winRate != null ? ` · 胜率 ${t.winRate}%` : ''}`, bad ? '#f59e0b' : undefined);
     })()}
       ${S.powerWarn ? `<div style="margin-top:4px;padding:5px 7px;border-radius:7px;background:rgba(245,158,11,.13);color:#fbbf24;font-size:11px">⚔ ${esc(S.powerWarn)}</div>` : ''}
+      ${S.cfg.battlePanel ? btHudHtml() : ''}
       ${row('挑战失败', `${S.deaths ?? 0} 次${S.deathStreak ? `（连败 ${S.deathStreak}）` : ''}`, S.deathStreak >= 3 ? '#f59e0b' : undefined)}
       ${row('闪光', String(S.shinySession), S.shinySession ? '#f472b6' : undefined)}
       ${row('夜间捕获', String(S.phaseCatch[2] || 0), (ph.idx === 2 && !(S.phaseCatch[2] > 0)) ? '#f59e0b' : '#93c5fd')}
@@ -3025,6 +2998,19 @@
       ${chk('grindMode', '道馆 / 四天王死磕（失败后自动继续）')}
       ${chk('autoSwitch', '残血自动换人（会覆盖手动操作）')}
       ${num('switchAtHp', '血量低于多少 % 换人', 5, 90, 5)}
+
+      ${group('战斗辅助（遥测 / 换人 / 战绩）')}
+      ${chk('battlePanel', 'HUD 显示对位卡（双方血量 / 克制 / 胜率）')}
+      ${chk('battleSwitchSmart', '劣势换人：本场胜率过低时换最克制的替补')}
+      ${num('battleSwitchWin', '胜率低于多少 % 换人', 1, 60, 1)}
+      ${chk('battleStats', '按区域记录胜负与掉血')}
+      ${num('battleWarnStreak', '同一区域连败几场提醒换区（0 = 不提醒）', 0, 20, 1)}
+      ${chk('battleAutoOrder', '自动把最佳对位拖到队首（实验）')}
+      <div style="display:flex;gap:6px;padding:4px 0">
+        <button id="pcauto-order-now" style="${smallBtn}">按当前区域重排首发</button>
+        <button id="pcauto-battle-diag" style="${smallBtn}">战斗探测</button>
+      </div>
+      <div style="color:#5b6478;font-size:11px;line-height:1.5">游戏本身全自动出招，脚本只能替你换人和排首发；「重排首发」用合成拖拽，游戏改版后可能失效，按钮会如实告诉你有没有生效。</div>
 
       ${group('多玩法')}
       ${chk('casinoAuto', '游戏城：进入后自动挂老虎机（消耗金钱）')}
@@ -3274,6 +3260,11 @@
     if (csvBtn) csvBtn.onclick = () => ledgerCsv();
     const gapBtn = $('#pcauto-dexgap', box);
     if (gapBtn) gapBtn.onclick = () => showDexGap();
+    /* ---- 战斗辅助 ---- */
+    const orderBtn = $('#pcauto-order-now', box);
+    if (orderBtn) orderBtn.onclick = () => btOrderNow();
+    const btDiagBtn = $('#pcauto-battle-diag', box);
+    if (btDiagBtn) btDiagBtn.onclick = () => battleDiag();
 
     $('#pcauto-close', box).onclick = () => box.remove();
     $('#pcauto-reset', box).onclick = () => {
@@ -3665,6 +3656,395 @@
     pushSend('event', "Poke'Catch 每日战报", text, true);
   }
 
+  /* ====================== 模块：战斗辅助（遥测 / 智能换人 / 区域战绩） ====================== */
+
+  /*
+   * 这个游戏没有手动出招：选招（bestMoveAgainst）、丢球（chooseBall 由宝可梦档位决定）、
+   * 逃跑全在游戏内部完成（bundle 里 data-move / move-btn 都是 0 命中）。所以「辅助战斗」
+   * 能做的只有三件事：
+   *   1) 遥测：把场上正在发生的事读出来 —— 双方是谁、剩多少血、克制倍率、预计几回合、胜率
+   *   2) 决策：用脚本自带的伤害表判断「谁更该在场」，必要时替你换人 / 排首发
+   *   3) 复盘：按区域累积战绩，效率掉了能立刻看出来
+   * DOM 依据（全部取自游戏 bundle，不是猜的）：
+   *   - 敌方：#arena .enemy[data-uid]，血条 .mini-hp .hp > div[style.width]，等级 .mini-lv
+   *   - 我方：#team-rail .tr-row（.acting 为在场），血条 .tr-hp i，data-uid 对应存档里的 uid
+   *   - 日志：#battle-log，整段 innerHTML 由游戏覆盖，只能读文本
+   * 血条只认 style.width 的百分比；读不到（例如将来改成 px）一律按 100% 处理 ——
+   * 宁可不换人，也不能把满血当残血天天抢操作。
+   */
+
+  const BT_KEY = 'pcauto.battles.v1';
+  const BT_KEEP = 60;          // 最多保留多少个区域的战绩
+
+  /** 读一个血条的宽度百分比；不是 % 就按 100（见文件头注释） */
+  function btPct(el) {
+    const w = (el && el.style && el.style.width) || '';
+    if (!/%\s*$/.test(w)) return 100;
+    const v = parseFloat(w);
+    return Number.isFinite(v) ? clamp(v, 0, 100) : 100;
+  }
+
+  /** assets/pokemon/25.png、assets/pokemon/shiny/25.png → 25 */
+  function btSpriteId(img) {
+    if (!img) return 0;
+    const src = img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('src') || '';
+    const m = /(\d{1,3})\.(?:png|webp|avif)/.exec(src);
+    return m ? +m[1] : 0;
+  }
+
+  /** "Nv.23" / "Lv.23" / "23" → 23 */
+  function btLevel(txt) {
+    const m = /(\d{1,3})/.exec(txt || '');
+    return m ? Math.max(1, +m[1]) : 1;
+  }
+
+  /** 我方队伍栏的 uid → 血量百分比 */
+  function btAllyHp() {
+    const out = {};
+    const rail = document.querySelector('#team-rail');
+    if (!rail) return out;
+    for (const row of rail.querySelectorAll('.tr-row[data-uid]')) {
+      out[+row.dataset.uid] = btPct(row.querySelector('.tr-hp i'));
+    }
+    return out;
+  }
+
+  /** 一次完整的战场快照；active=false 时其余字段可能为 null */
+  function battleProbe() {
+    const arena = document.querySelector('#arena');
+    const rail = document.querySelector('#team-rail');
+    const logEl = document.querySelector('#battle-log');
+    const log = logEl ? (logEl.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    const foes = arena ? [...arena.querySelectorAll('.enemy[data-uid]')] : [];
+    const foeEl = foes.filter((e) => !e.classList.contains('fainted'))[0] || null;
+    const acting = rail ? rail.querySelector('.tr-row.acting') : null;
+    const save = S.save || {};
+    const uid = acting ? +acting.dataset.uid : 0;
+    const meMon = uid
+      ? (save.team || []).find((m) => +m.uid === uid) || (save.mons || []).find((m) => +m.uid === uid) || null
+      : null;
+    const me = meMon && acting ? {
+      uid: +meMon.uid, id: meMon.id, level: meMon.level || 1, shiny: !!meMon.shiny,
+      hpPct: btPct(acting.querySelector('.tr-hp i')),
+    } : null;
+    const foe = foeEl ? {
+      uid: foeEl.dataset.uid || '',
+      id: btSpriteId(foeEl.querySelector('img')),
+      level: btLevel((foeEl.querySelector('.mini-lv') || {}).textContent),
+      hpPct: btPct(foeEl.querySelector('.mini-hp .hp > div')),
+      guard: foeEl.classList.contains('guard'),
+    } : null;
+    return {
+      active: !!(me && foe && me.id && foe.id),
+      me, foe, log, at: now(),
+      foeFainted: !!(arena && arena.querySelector('.enemy.fainted')),
+    };
+  }
+
+  /**
+   * 对位预测：用脚本自带的伤害表（复现游戏 V() / ka()）粗算
+   *   ttk = 我还需要几回合打倒对面，ttd = 对面几回合打倒我
+   * winPct 是启发式：领先回合越多越接近 100%，落后则按回合比例压到 55% 以下。
+   * 不追求精确（命中、暴击、连击、增益都没建模），只用于「该不该换人」这种相对判断。
+   */
+  function btForecast(me, foe) {
+    if (!me || !foe || !me.id || !foe.id) return null;
+    const myTypes = TA_DEX[me.id];
+    const foeTypes = TA_DEX[foe.id];
+    if (!myTypes || !foeTypes) return null;
+    const mv = taBestMove(me, foeTypes);
+    const foeMv = taBestMove(foe, myTypes);
+    const myMax = taMaxHp({ id: me.id, level: me.level || 1 });
+    const foeMax = taMaxHp({ id: foe.id, level: foe.level || 1 });
+    const myHp = Math.max(1, (myMax * clamp(me.hpPct ?? 100, 1, 100)) / 100);
+    const foeHp = Math.max(1, (foeMax * clamp(foe.hpPct ?? 100, 1, 100)) / 100);
+    const myDmg = mv ? Math.max(1, taDamage(me, foe, mv, mv.eff) * mv.acc) : 1;
+    const foeDmg = foeMv ? Math.max(1, taDamage(foe, me, foeMv, foeMv.eff) * foeMv.acc) : 1;
+    const ttk = Math.max(1, Math.ceil(foeHp / myDmg));
+    const ttd = Math.max(1, Math.ceil(myHp / foeDmg));
+    const mySpe = (taStats(me) || {}).spe || 0;
+    const foeSpe = (taStats(foe) || {}).spe || 0;
+    const meFirst = mySpe >= foeSpe;
+    let winPct;
+    if (ttk <= ttd) winPct = clamp(60 + (ttd - ttk) * 12 + (meFirst ? 4 : 0), 55, 99);
+    else winPct = clamp(52 * (ttd / ttk), 2, 54);
+    return {
+      move: mv ? mv.key : null, moveType: mv ? mv.type : null, eff: mv ? mv.eff : 1,
+      myDmgPerTurn: Math.round(myDmg), foeDmgPerTurn: Math.round(foeDmg),
+      ttk, ttd, meFirst, winPct: Math.round(winPct),
+    };
+  }
+
+  /**
+   * 替补候选（纯算法，血量由外部传入，方便离线测试）
+   * @param state battleProbe() 的结果
+   * @param team  save.team
+   * @param hpOf  uid → 血量百分比
+   */
+  function btBenchCandidates(state, team, hpOf, minHp = 20) {
+    if (!state || !state.foe || !state.foe.id) return [];
+    const foe = state.foe;
+    const curUid = state.me ? +state.me.uid : 0;
+    const cur = state.me ? btForecast(state.me, foe) || {} : {};
+    const out = [];
+    for (const mon of team || []) {
+      if (+mon.uid === curUid) continue;
+      const hp = hpOf ? hpOf(+mon.uid) : 100;
+      if (!(hp > minHp)) continue;
+      const fc = btForecast({ id: mon.id, level: mon.level || 1, shiny: !!mon.shiny, hpPct: hp }, foe);
+      if (!fc) continue;
+      out.push({
+        uid: +mon.uid, id: mon.id, name: taMonName(mon), hpPct: Math.round(hp),
+        winPct: fc.winPct, ttk: fc.ttk, ttd: fc.ttd, gain: fc.winPct - (cur.winPct || 0),
+      });
+    }
+    return out.sort((a, b) => b.winPct - a.winPct || b.hpPct - a.hpPct);
+  }
+
+  /** 换人：残血（autoSwitch）或本场胜率过低（battleSwitchSmart）时挑最克制的替补 */
+  function smartSwitch() {
+    const cfg = S.cfg;
+    if (!cfg.autoSwitch && !cfg.battleSwitchSmart) return;
+    if (userBusy(3000) || S.feeding) return;
+    if (now() - (S.switchAt || 0) < 4000) return;
+    const st = S.battle && now() - (S.battle.at || 0) < 800 ? S.battle : battleProbe();
+    if (!st.active) return;
+    const fc = btForecast(st.me, st.foe) || {};
+    const danger = !!cfg.autoSwitch && st.me.hpPct <= (cfg.switchAtHp || 30);
+    const losing = !!cfg.battleSwitchSmart && (fc.winPct ?? 100) <= (cfg.battleSwitchWin || 25);
+    if (!danger && !losing) return;
+
+    const hp = btAllyHp();
+    const pick = btBenchCandidates(st, (S.save && S.save.team) || [], (u) => hp[u] ?? 100)[0];
+    if (!pick) return;
+    // 劣势换人要求真的更优（防同分来回换）；纯残血换人要求替补还算健康
+    if (!danger && pick.gain < 8) return;
+    if (danger && !losing && pick.hpPct <= 55) return;
+    const rail = document.querySelector('#team-rail');
+    const row = rail ? rail.querySelector(`.tr-row[data-uid="${pick.uid}"]`) : null;
+    if (!row) return;
+    S.switchAt = now();
+    fire(row);
+    log('battle',
+        `${losing ? '劣势换人' : '残血换人'}：${taMonName({ id: st.me.id })} ${Math.round(st.me.hpPct)}%`
+        + `（胜率 ${fc.winPct ?? '?'}%）→ ${pick.name} ${pick.hpPct}%（胜率 ${pick.winPct}%）`);
+  }
+
+  /** 当前区域：章节 + 节点 */
+  function btZone(save) {
+    const adv = (save && save.adv) || {};
+    const node = adv.nodes && adv.nodes[adv.node];
+    return {
+      key: `${adv.chapter ?? 0}:${adv.node ?? 0}`,
+      name: (node && node.name) || `第${(adv.chapter ?? 0) + 1}章`,
+    };
+  }
+
+  function btData() {
+    const d = safeParse(lsGet(BT_KEY), null);
+    const out = d && typeof d === 'object' ? d : {};
+    if (!out.zones || typeof out.zones !== 'object') out.zones = {};
+    if (typeof out.streak !== 'number') out.streak = 0;
+    return out;
+  }
+
+  function btSaveData(d) {
+    // 只按最近使用时间留 BT_KEEP 个区域，别让 localStorage 无限长
+    const keys = Object.keys(d.zones).sort((a, b) => (d.zones[b].lastAt || 0) - (d.zones[a].lastAt || 0));
+    for (const k of keys.slice(BT_KEEP)) delete d.zones[k];
+    try { lsSet(BT_KEY, JSON.stringify(d)); } catch { /* 存不下就算了，不能因此中断挂机 */ }
+  }
+
+  /** 记一场战斗：胜负 / 掉血 / 用时 */
+  function btRecord(win, info) {
+    if (!S.cfg.battleStats) return;
+    const d = btData();
+    const z = d.zones[info.key] || (d.zones[info.key] = { name: info.name, n: 0, win: 0, loss: 0, hpLoss: 0, ms: 0, lastAt: 0 });
+    z.name = info.name || z.name;
+    z.n++;
+    if (win) { z.win++; d.streak = 0; } else { z.loss++; d.streak++; d.streakKey = info.key; }
+    z.hpLoss += Math.max(0, Math.round(info.hpLoss || 0));
+    z.ms += Math.max(0, Math.round(info.ms || 0));
+    z.lastAt = now();
+    btSaveData(d);
+  }
+
+  /** 当前区域的战绩摘要 */
+  function btZoneStats(save) {
+    const z = btZone(save);
+    const rec = btData().zones[z.key];
+    if (!rec || !rec.n) return { key: z.key, name: z.name, n: 0, win: 0, loss: 0, rate: null, avgHpLoss: 0 };
+    return {
+      key: z.key, name: z.name, n: rec.n, win: rec.win, loss: rec.loss,
+      rate: Math.round((rec.win / rec.n) * 100),
+      avgHpLoss: Math.round((rec.hpLoss || 0) / rec.n),
+    };
+  }
+
+  /** 350ms：维护 S.battle，并在战斗结束时落一条战绩 */
+  function battleTick() {
+    const st = battleProbe();
+    const prev = S.battle;
+    if (st.active) {
+      if (!prev || !prev.active) {
+        const z = btZone(S.save);
+        S.btFight = {
+          at: now(), hp0: st.me.hpPct, hpLast: st.me.hpPct,
+          zone: z.key, zoneName: z.name, foeId: st.foe.id, foeDown: false, deaths0: S.deaths,
+        };
+      } else if (S.btFight) {
+        S.btFight.hpLast = st.me.hpPct;
+        if (st.foeFainted) S.btFight.foeDown = true;
+      }
+      S.battle = st;
+      return;
+    }
+    if (prev && prev.active && S.btFight) {
+      const f = S.btFight;
+      S.btFight = null;
+      const dur = now() - f.at;
+      // 换场景 / 切图会有一瞬间读不到敌方，别把这种抖动算成一场战斗
+      if (dur < 1200) { S.battle = st; return; }
+      const died = f.deaths0 != null && S.deaths != null && S.deaths > f.deaths0;
+      btRecord(!died, {
+        key: f.zone, name: f.zoneName,
+        hpLoss: (f.hp0 ?? 0) - (f.hpLast ?? f.hp0 ?? 0),
+        ms: dur,
+      });
+      btStreakWarn();
+    }
+    S.battle = st;
+  }
+
+  /** 连败提醒：同一区域连续失败 N 场就提示换区（10 分钟最多一次） */
+  function btStreakWarn() {
+    const n = S.cfg.battleWarnStreak || 0;
+    if (!n) return;
+    const d = btData();
+    if (d.streak < n) return;
+    // 只在「之前提醒过」时才看冷却，否则 S.btWarnAt=0 会把开场头 10 分钟也压住
+    if (S.btWarnAt && now() - S.btWarnAt < 600000) return;
+    const z = d.zones[d.streakKey || ''] || {};
+    S.btWarnAt = now();
+    const rate = z.n ? Math.round(((z.win || 0) / z.n) * 100) : null;
+    const msg = `${z.name || '当前区域'}已连败 ${d.streak} 场`
+        + `${rate != null ? `（本区胜率 ${rate}%）` : ''}，建议换到等级更低的区域`;
+    log('warn', msg);
+    notify('连败提醒', msg, 'pcauto-streak');
+    pushSend('stall', '连败提醒', msg);
+  }
+
+  /** 首发建议：按当前区域敌人池给全队打分，返回最该首发的那只 */
+  function btLeadPick(save) {
+    const team = (save && save.team) || [];
+    if (team.length < 2) return null;
+    const pool = taEnemyPool();
+    if (!pool.length) return null;
+    let best = null;
+    for (const mon of team) {
+      const ev = taEvaluate(mon, pool, 0);
+      if (!ev) continue;
+      if (!best || ev.score > best.score) best = { mon, score: ev.score, uid: +mon.uid, name: taMonName(mon) };
+    }
+    if (!best) return null;
+    best.isFirst = team[0] ? +team[0].uid === best.uid : false;
+    return best;
+  }
+
+  /**
+   * 把某只拖到队首。游戏的换位走 pointer 拖拽（bundle：#team-rail 的 pointerdown/move/up，
+   * 位移超过 6px 才开始拖），这里合成同一串事件。不可靠 —— 游戏改版或浏览器拦截合成指针
+   * 事件就会失败，所以默认关闭，且调用后必须复核队列顺序，没变就如实报失败。
+   */
+  function btApplyLead(uid) {
+    const rail = document.querySelector('#team-rail');
+    if (!rail) return { ok: false, msg: '找不到队伍栏' };
+    const rows = [...rail.querySelectorAll('.tr-row[data-uid]')];
+    const idx = rows.findIndex((r) => +r.dataset.uid === +uid);
+    if (idx < 0) return { ok: false, msg: '队伍里没有这只' };
+    if (idx === 0) return { ok: true, msg: '已经在队首' };
+    const step = rows.length > 1 ? rows[1].offsetTop - rows[0].offsetTop : rows[0].offsetHeight || 56;
+    const box = rows[idx].getBoundingClientRect();
+    const x = box.left + box.width / 2;
+    const y0 = box.top + box.height / 2;
+    const opts = (y) => ({
+      bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: 'mouse',
+      isPrimary: true, clientX: x, clientY: y, buttons: 1,
+    });
+    try {
+      rows[idx].dispatchEvent(new PointerEvent('pointerdown', opts(y0)));
+      for (let i = 1; i <= idx; i++) rail.dispatchEvent(new PointerEvent('pointermove', opts(y0 - step * i)));
+      rail.dispatchEvent(new PointerEvent('pointerup', opts(y0 - step * idx)));
+    } catch (e) {
+      return { ok: false, msg: '合成指针事件失败：' + (e && e.message) };
+    }
+    return { ok: true, msg: '已发出换位操作' };
+  }
+
+  /** 设置面板里的「按当前区域重排首发」 */
+  function btOrderNow() {
+    const pick = btLeadPick(S.save);
+    if (!pick) { log('warn', '队伍或区域数据不足，无法排序'); return; }
+    if (pick.isFirst) { log('info', `首发已是最优：${pick.name}（${pick.score} 分）`); return; }
+    if (!S.cfg.battleAutoOrder) {
+      log('info', `建议首发 ${pick.name}（${pick.score} 分），但「自动重排首发」没开`);
+      return;
+    }
+    const r = btApplyLead(pick.uid);
+    if (!r.ok) { log('warn', '重排首发失败：' + r.msg); return; }
+    log('battle', `把 ${pick.name} 拖到队首（${pick.score} 分）`);
+    setTimeout(() => {
+      const rail = document.querySelector('#team-rail');
+      const head = rail ? rail.querySelector('.tr-row[data-uid]') : null;
+      const ok = head && +head.dataset.uid === +pick.uid;
+      log(ok ? 'info' : 'warn', ok ? '首发顺序已生效' : '首发顺序没有变化：游戏可能不接受合成拖拽，请手动拖动');
+    }, 1200);
+  }
+
+  /** HUD 上的对位卡 */
+  function btHudHtml() {
+    const st = S.battle;
+    if (!st || !st.active) return '';
+    const fc = btForecast(st.me, st.foe) || {};
+    const eff = fc.eff ?? 1;
+    const effText = eff >= 4 ? '绝佳 ×4' : eff >= 2 ? '绝佳 ×2' : eff === 0.5 ? '不好 ×½' : eff === 0.25 ? '不好 ×¼' : eff === 0 ? '无效' : '普通';
+    const effColor = eff >= 2 ? '#8ee98e' : eff < 1 ? '#f87171' : '#c7d0e0';
+    const win = fc.winPct ?? null;
+    const winColor = win == null ? '#e8ecf4' : win >= 70 ? '#8ee98e' : win >= 40 ? '#fbbf24' : '#f87171';
+    const zs = btZoneStats(S.save);
+    const r = (k, v, color) => `<div style="display:flex;justify-content:space-between;gap:8px"><span style="color:#8b93a7">${k}</span><b style="color:${color || '#e8ecf4'}">${v}</b></div>`;
+    return `${r('对位', `${esc(taMonName({ id: st.me.id }))} ${Math.round(st.me.hpPct)}% vs ${esc(taMonName({ id: st.foe.id }))} ${Math.round(st.foe.hpPct)}%`, '#93c5fd')}
+      ${r('克制', effText, effColor)}
+      ${win != null ? r('胜率', `约 ${win}% · ${fc.ttk ?? '?'} 回合${fc.meFirst ? ' · 先手' : ''}`, winColor) : ''}
+      ${zs.n ? r('本区战绩', `${zs.n} 战 ${zs.win} 胜 ${zs.loss} 负${zs.rate != null ? ` · ${zs.rate}%` : ''}`, (zs.rate ?? 100) >= 90 ? undefined : '#fbbf24') : ''}`;
+  }
+
+  /** 战斗探测：和商店探测一样，出问题先把现场抄下来 */
+  function battleDiag() {
+    const st = battleProbe();
+    const info = {
+      version: VERSION,
+      active: st.active,
+      me: st.me,
+      foe: st.foe,
+      forecast: st.active ? btForecast(st.me, st.foe) : null,
+      zone: btZone(S.save).name,
+      zoneStats: btZoneStats(S.save),
+      arenaEnemies: document.querySelectorAll('#arena .enemy').length,
+      railRows: document.querySelectorAll('#team-rail .tr-row').length,
+      streak: btData().streak,
+      logTail: (st.log || '').slice(-160),
+    };
+    const text = JSON.stringify(info, null, 2);
+    const fallback = () => log('info', '战斗探测：' + text.replace(/\s+/g, ' '));
+    try {
+      const p = navigator.clipboard?.writeText(text);
+      if (p && typeof p.then === 'function') p.then(() => log('info', '战斗探测已复制到剪贴板')).catch(fallback);
+      else fallback();
+    } catch { fallback(); }
+    return info;
+  }
+
   /* ====================== 主循环 ====================== */
 
   let wakeLock = null;
@@ -3706,7 +4086,8 @@
       handleCutscene();
       handleModals();
       handleItemChoice();
-      autoSwitch();
+      battleTick();          // 战斗遥测：维护 S.battle，结束时落一条区域战绩
+      smartSwitch();         // 残血 / 劣势换人（内部按开关决定要不要动手）
       // 低频（约 2 秒）：本身就带长冷却的模块，没必要每 350ms 查一遍 DOM
       if (tickN % 6 === 0) {
         ensureSpeed();
@@ -3742,7 +4123,7 @@
     if (!S.awaySnap) { S.awaySnap = tallySnap(); S.awayLastSeen = now(); }
 
     // 挂到页面的 window 上，控制台里才能访问
-    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym }; } catch { /* 忽略 */ }
+    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats }; } catch { /* 忽略 */ }
     ensureRealDescs();   // 先存下原始描述符，之后无论保活开没开，isRealHidden() 都能读到真值
     startGradeWatcher();
     safeInterval('tick', tick, TICK_MS);

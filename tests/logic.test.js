@@ -1,8 +1,8 @@
 /**
- * 3.7.0 新增逻辑的离线自测（不依赖浏览器 / 油猴）
+ * 3.7 / 3.8 新增逻辑的离线自测（不依赖浏览器 / 油猴）
  *
- * 做法：把 userscript 里「商店补货 → 培育屋监控」这一段源码切出来，
- * 用一个假的运行环境（S / localStorage / document / fire）包起来跑，
+ * 做法：把 userscript 里「商店补货 → 主循环」这一段源码切出来，
+ * 用一个假的运行环境（S / localStorage / document / fire / TA_* 伤害层）包起来跑，
  * 这样改逻辑时不用开游戏就能先验一遍。
  *
  *   node tests/logic.test.js
@@ -47,9 +47,25 @@ function makeEnv(opts = {}) {
       ledger: true,
       dailyReport: false,
       dailyReportHour: 0,
+      // 战斗辅助
+      battlePanel: true,
+      battleSwitchSmart: false,
+      battleSwitchWin: 25,
+      battleAutoOrder: false,
+      battleStats: true,
+      battleWarnStreak: 3,
+      autoSwitch: false,
+      switchAtHp: 30,
     }, opts.cfg || {}),
     keepAliveOn: false,
     save: opts.save || null,
+    // 战斗辅助要用到的运行时状态
+    battle: null,
+    btFight: null,
+    btWarnAt: 0,
+    deaths: 0,
+    switchAt: 0,
+    feeding: false,
   };
 
   const BERRY_BUFFS = {
@@ -65,8 +81,10 @@ function makeEnv(opts = {}) {
   const env = {
     S,
     BERRY_BUFFS,
+    VERSION: 'test',
     clamp: (v, a, b) => Math.max(a, Math.min(b, v)),
     fmt: (n) => String(Math.round(n || 0)),
+    esc: (s) => String(s == null ? '' : s),
     now: () => (env.clock ? env.clock : Date.now()),
     lsGet: (k) => (store.has(k) ? store.get(k) : null),
     lsSet: (k, v) => { store.set(k, v); return true; },
@@ -82,6 +100,15 @@ function makeEnv(opts = {}) {
     isRealHidden: () => false,
     readSave: () => env.S.save,
     setTimeout: (fn) => { env.timers.push(fn); return 0; },
+    // 战斗辅助要用的伤害层（用可预测的假实现，专测 3.8 的判定与统计逻辑）
+    TA_DEX: new Proxy({}, { get: () => ['normal'] }),
+    taStats: () => ({ hp: 100, atk: 50, def: 50, spa: 50, spd: 50, spe: 50 }),
+    taMaxHp: (mon) => 100 + (mon.level || 1) * 2,
+    taBestMove: () => ({ key: 'tackle', type: 'normal', phys: true, power: 40, eff: 2, stab: 1, acc: 1, score: 80 }),
+    taDamage: () => 40,
+    taEvaluate: () => ({ score: 50 }),
+    taEnemyPool: () => [],
+    taMonName: (mon) => `#${mon.id}`,
   };
   env.clock = 0;
   env.timers = [];
@@ -94,7 +121,9 @@ function makeEnv(opts = {}) {
   const names = Object.keys(env);
   const factory = new Function(...names, `${moduleCode}
     return { shopPlan, autoShop, settleShop, shopDiag, ledgerTick, ledgerAdd, ledgerToday, ledgerData,
-             ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY };`);
+             ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
+             btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
+             btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -299,6 +328,163 @@ function mockShopDom(rows) {
   ok(text.includes('图鉴'), '战报带图鉴缺口');
 }
 
+/* ---------------- 7. 战斗遥测与换人判定 ---------------- */
+
+{
+  const env = makeEnv();
+  const A = env.api;
+
+  /* 血条宽度：只认百分比，px 一律当满血（否则每只都被当残血，天天抢操作） */
+  eq(A.btPct({ style: { width: '55%' } }), 55, "btPct 读百分比");
+  eq(A.btPct({ style: { width: '0px' } }), 100, 'px 宽度视为满血');
+  eq(A.btPct({ style: { width: '' } }), 100, '读不到宽度视为满血');
+  eq(A.btPct(null), 100, '元素不存在也不炸');
+
+  /* 图鉴号从精灵地址反推 */
+  eq(A.btSpriteId({ src: 'assets/pokemon/25.png' }), 25, '普通精灵');
+  eq(A.btSpriteId({ src: 'https://x/assets/pokemon/shiny/150.png' }), 150, '闪光精灵');
+  eq(A.btSpriteId({ src: 'assets/pokemon/egg.png' }), 0, '非编号地址返回 0');
+
+  eq(A.btLevel('Nv.23'), 23, '等级文案 Nv.23');
+  eq(A.btLevel(''), 1, '没有等级时按 1 级');
+
+  /* 对位预测：ttk/ttd 与胜率的相关性（伤害层用 40 固定伤害的假实现） */
+  const me = { id: 1, level: 50, hpPct: 100 };
+  const foe = { id: 2, level: 50, hpPct: 100 };
+  const f1 = A.btForecast(me, foe);
+  ok(f1 && f1.ttk >= 1 && f1.ttd >= 1, 'btForecast 给出回合数');
+  ok(f1.winPct >= 55 && f1.winPct <= 99, '满血对满血不会给出劣势胜率');
+  const f2 = A.btForecast(me, { ...foe, hpPct: 20 });
+  ok(f2.winPct > f1.winPct, '残血敌人更容易赢');
+  ok(f2.ttk <= f1.ttk, '残血敌人需要更少回合');
+  const f3 = A.btForecast({ ...me, hpPct: 10 }, foe);
+  ok(f3.winPct < 55, '自己残血时胜率掉到 55 以下');
+  eq(A.btForecast({ id: 1, level: 5 }, null), null, '没有敌人就返回 null');
+}
+
+/* ---------------- 8. 替补挑选 ---------------- */
+
+{
+  const env = makeEnv();
+  const api = env.api;
+  const team = [
+    { uid: 1, id: 1, level: 50 },
+    { uid: 2, id: 2, level: 50 },
+    { uid: 3, id: 3, level: 50 },
+    { uid: 4, id: 4, level: 50 },   // 血量见底，不该被选中
+  ];
+  const hp = { 1: 40, 2: 100, 3: 80, 4: 5 };
+  const state = { active: true, me: { uid: 1, id: 1, level: 50, hpPct: 40 }, foe: { id: 2, level: 50, hpPct: 100 } };
+  const cands = api.btBenchCandidates(state, team, (u) => hp[u]);
+  ok(!cands.some((c) => c.uid === 1), '不含在场的那只');
+  ok(!cands.some((c) => c.uid === 4), '残血替补被排除');
+  eq(cands.length, 2, '只剩两只健康的');
+  ok(cands[0].winPct >= cands[1].winPct, '按胜率降序');
+  eq(api.btBenchCandidates({ foe: null }, team, () => 100).length, 0, '没有敌人时没有候选');
+}
+
+/* ---------------- 9. 区域战绩 / 连败提醒 ---------------- */
+
+{
+  const env = makeEnv({ cfg: { battleStats: true, battleWarnStreak: 3 } });
+  const api = env.api;
+  const save = { adv: { chapter: 0, node: 2, nodes: [{ name: '一号路' }, { name: '二号路' }, { name: '常磐森林' }] } };
+  const zone = api.btZone(save);
+  eq(zone.name, '常磐森林', '区域名取 adv.nodes[node].name');
+  eq(zone.key, '0:2', '区域键 = 章节:节点');
+
+  api.btRecord(true, { key: zone.key, name: zone.name, hpLoss: 20, ms: 3000 });
+  api.btRecord(true, { key: zone.key, name: zone.name, hpLoss: 40, ms: 5000 });
+  api.btRecord(false, { key: zone.key, name: zone.name, hpLoss: 100, ms: 4000 });
+  const st = api.btZoneStats(save);
+  eq(st.n, 3, '三场战斗');
+  eq(st.win, 2, '两胜');
+  eq(st.loss, 1, '一负');
+  eq(st.rate, 67, '胜率四舍五入');
+  eq(st.avgHpLoss, 53, '平均掉血 (20+40+100)/3');
+
+  /* 连败 3 场后提醒；10 分钟内不重复 */
+  api.btRecord(false, { key: zone.key, name: zone.name, hpLoss: 100, ms: 4000 });
+  api.btRecord(false, { key: zone.key, name: zone.name, hpLoss: 100, ms: 4000 });
+  env.clock = 5000;
+  api.btStreakWarn();
+  eq(env.logs.filter((l) => l.includes('连败')).length, 1, '连败达阈值提醒一次');
+  eq(env.push.filter((p) => p.title === '连败提醒').length, 1, '连败也走手机推送');
+  env.clock = 60000;
+  api.btStreakWarn();
+  eq(env.logs.filter((l) => l.includes('连败')).length, 1, '10 分钟内不重复提醒');
+  env.clock = 700000;
+  api.btStreakWarn();
+  eq(env.logs.filter((l) => l.includes('连败')).length, 2, '过了 10 分钟可以再提醒');
+
+  /* 赢一场就清零连败 */
+  api.btRecord(true, { key: zone.key, name: zone.name, hpLoss: 0, ms: 2000 });
+  eq(api.btData().streak, 0, '赢了就清空连败计数');
+
+  /* 关掉 battleStats 就不再记账 */
+  const off = makeEnv({ cfg: { battleStats: false } });
+  off.api.btRecord(true, { key: 'x', name: 'y' });
+  ok(!off.api.btData().zones.x, '关了统计就不写 localStorage');
+}
+
+/* ---------------- 10. 战斗结束结算（battleTick） ---------------- */
+
+{
+  const env = makeEnv({ cfg: { battleStats: true, battleWarnStreak: 0 } });
+  const api = env.api;
+  env.S.save = { adv: { chapter: 3, node: 1, nodes: [null, { name: '雪峰' }] } };
+  env.clock = 10000;
+
+  /* 假环境没有 #arena，battleProbe 永远 inactive；手工摆一个进行中的战斗 */
+  env.S.battle = { active: true, me: { uid: 1, id: 1, hpPct: 90 }, foe: { id: 2, hpPct: 10 } };
+  env.S.btFight = { at: 5000, hp0: 90, hpLast: 40, zone: '3:1', zoneName: '雪峰', deaths0: env.S.deaths };
+  env.S.deaths = 0;
+  api.battleTick();
+  const st = api.btZoneStats(env.S.save);
+  eq(st.n, 1, '战斗结束落一条战绩');
+  eq(st.win, 1, '没掉死亡就算赢');
+  eq(st.avgHpLoss, 50, '掉血 = 开战前 - 最后一帧');
+
+  /* 死亡了就算负 */
+  env.clock = 30000;
+  env.S.battle = { active: true, me: { uid: 1, id: 1, hpPct: 90 }, foe: { id: 2, hpPct: 10 } };
+  env.S.btFight = { at: 20000, hp0: 90, hpLast: 0, zone: '3:1', zoneName: '雪峰', deaths0: 0 };
+  env.S.deaths = 1;
+  api.battleTick();
+  eq(api.btZoneStats(env.S.save).loss, 1, '死亡记成负');
+
+  /* 太短的战斗（<1.2 秒）算场景抖动，不记账 */
+  env.clock = 40000;
+  env.S.battle = { active: true, me: { uid: 1, id: 1, hpPct: 90 }, foe: { id: 2, hpPct: 10 } };
+  env.S.btFight = { at: 39500, hp0: 90, hpLast: 90, zone: '3:1', zoneName: '雪峰', deaths0: 1 };
+  api.battleTick();
+  eq(api.btZoneStats(env.S.save).n, 2, '抖动不产生新战绩');
+}
+
+/* ---------------- 11. 首发建议 ---------------- */
+
+{
+  const env = makeEnv({ save: { team: [{ uid: 1, id: 1, level: 20 }, { uid: 2, id: 2, level: 20 }, { uid: 3, id: 3, level: 20 }] } });
+  env.taEnemyPool = () => [{ id: 9, level: 20, w: 1 }];
+  env.taEvaluate = (mon) => ({ score: mon.id === 2 ? 80 : 50 });
+  const names = Object.keys(env).filter((k) => k !== 'api');
+  env.api = new Function(...names, `${moduleCode}
+    return { btLeadPick };`)(...names.map((k) => env[k]));
+
+  const pick = env.api.btLeadPick(env.S.save);
+  ok(!!pick, '有敌人池时给出首发建议');
+  eq(pick.uid, 2, '选出评分最高的那只');
+  eq(pick.isFirst, false, '当前队首不是它');
+  ok(pick.score === 80, '带回评分');
+
+  /* 敌人池为空 / 队伍不足两只 → 不瞎推荐 */
+  env.taEnemyPool = () => [];
+  const empty = new Function(...names, `${moduleCode}
+    return { btLeadPick };`)(...names.map((k) => env[k]));
+  eq(empty.btLeadPick(env.S.save), null, '没有敌人池就不推荐');
+  eq(env.api.btLeadPick({ team: [{ uid: 1, id: 1 }] }), null, '只有一只也不用排');
+}
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${pass} 项`);
@@ -307,4 +493,4 @@ if (fails.length) {
   fails.forEach((f) => console.log('  ✗ ' + f));
   process.exit(1);
 }
-console.log('✅ 3.7.0 新增逻辑全部通过');
+console.log('✅ 3.7 / 3.8 新增逻辑全部通过');

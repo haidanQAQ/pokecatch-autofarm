@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.8.1
-// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖
+// @version      3.9.0
+// @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9 新增宝可梦详情「升到下一级」（先吃已有经验糖，不够再问买不买）
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
 // @match        https://pokecatch-online.pages.dev/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.8.1';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.9.0';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -109,6 +109,7 @@
     autoShop: false,
     shopKeepCandy: 3,         // 经验糖补到几颗（0 = 不买）；实际会挑买得起且每 ₽ 经验最高的那档
     shopBuyOneOff: false,     // 顺便买 50 万的一次性进化道具（每件只能买一次）
+    lvAutoBuy: true,          // 详情页「升到下一级」缺糖时，是否弹窗询问购买
     shopMoneyFloor: 20000,    // 金钱低于此值一律不买
     shopDailyCap: 300000,     // 每天采购最多花多少 ₽（0 = 不限）
     shopEveryMin: 10,         // 采购检查间隔（分钟）
@@ -2991,6 +2992,7 @@
       ${num('berryReserve', '每种保留几颗不吃', 0, 99, 1)}
       <div style="display:flex;flex-wrap:wrap;gap:8px;padding:4px 0" id="pcauto-berry-fam"></div>
       ${chk('useRareCandy', '一键喂糖包含神奇糖果（Rare Candy）')}
+        ${chk('lvAutoBuy', '「升到下一级」缺糖时弹窗询问是否购买')}
       ${chk('powerGuard', '战力 / 胜率告警')}
       ${chk('teamAdvisor', '配队建议提醒（队伍明显落后时日志提示）')}
 
@@ -4095,6 +4097,264 @@
     return info;
   }
 
+  /* ====================== 操作：宝可梦详情「升到下一级」 ====================== */
+  // 只在队伍详情弹窗里出现一个按钮：先吃自己有的糖，不够再问要不要花钱买。
+  // 关键点：
+  //  1) 升级只靠点游戏自己的 .dc-candy 按钮，不碰存档（脚本从不写存档）。
+  //  2) 剩余经验从弹窗的「经验值 a / b」读，读不到就不瞎报价格。
+  //  3) 买糖必须回商店（弹窗会挡住），所以记下队伍格子序号，买完按序号点回去。
+  const LV_CANDIES = ['exp-candy-s', 'exp-candy-m', 'exp-candy-xl', 'exp-candy-big'];
+  const LV_XP = { 'exp-candy-s': 1000, 'exp-candy-m': 15000, 'exp-candy-xl': 250000, 'exp-candy-big': 1000000 };
+  const LV_PRICE = { 'exp-candy-s': 1200, 'exp-candy-m': 7200, 'exp-candy-xl': 48000, 'exp-candy-big': 96000 };
+  const LV_NAME = { 'exp-candy-s': '经验糖S', 'exp-candy-m': '经验糖M', 'exp-candy-xl': '经验糖XL', 'exp-candy-big': '经验糖MAX' };
+
+  function lvParseNum(txt) {
+    const s = String(txt || '').replace(/[\s,，]/g, '');
+    const m = s.match(/(-?\d+(?:\.\d+)?)\s*([kKmM千万]?)/);
+    if (!m) return null;
+    let v = parseFloat(m[1]);
+    if (!isFinite(v)) return null;
+    const u = m[2];
+    if (u === 'k' || u === 'K' || u === '千') v *= 1000;
+    else if (u === 'm' || u === 'M' || u === '万') v *= 1e6;
+    return Math.round(v);
+  }
+
+  function lvModal() { return document.querySelector('.modal.mon-modal'); }
+
+  function lvModalLevel(m) {
+    const el = m.querySelector('.rt-lv') || m.querySelector('.dc-facts .v') || m.querySelector('.lvl');
+    const n = lvParseNum((el && el.textContent) || '');
+    return n;
+  }
+
+  // 返回 { cur, max, need }；读不到返回 null（宁可不报价，也不乱算）
+  function lvXpNeed(m) {
+    const span = m.querySelector('.dc-xp .xpbar > span') || m.querySelector('.xpbar > span');
+    const t = (span && span.textContent) || '';
+    const parts = t.split('/');
+    if (parts.length < 2) return null;
+    const cur = lvParseNum(parts[0]);
+    const max = lvParseNum(parts[1]);
+    if (cur == null || max == null || !(max > 0)) return null;
+    return { cur: cur, max: max, need: Math.max(0, max - cur), text: t.trim() };
+  }
+
+  function lvCounts(save) {
+    const items = (save && save.items) || {};
+    const out = {};
+    for (const id of LV_CANDIES) out[id] = Math.max(0, Number(items[id] || 0));
+    return out;
+  }
+
+  function lvOwnedXp(counts) {
+    return LV_CANDIES.reduce((a, id) => a + (counts[id] || 0) * LV_XP[id], 0);
+  }
+
+  // 最省浪费的吃法：从最小的开始，够则停（升级后多余经验会带进下一级，所以不必精算）
+  function lvFeedOrder(counts) {
+    const order = [];
+    for (const id of LV_CANDIES) for (let i = 0; i < (counts[id] || 0); i++) order.push(id);
+    return order;
+  }
+
+  // 还差 needXp 时，买哪种糖最便宜（同价位取大颗，减少点击）
+  function lvPlanBuy(needXp, counts, money, floor) {
+    if (!(needXp > 0)) return { ok: false, reason: '不需要额外经验' };
+    const budget = Math.max(0, (Number(money) || 0) - (Number(floor) || 0));
+    if (budget <= 0) return { ok: false, reason: '金钱低于保留线，不自动购买' };
+    let best = null;
+    for (const id of LV_CANDIES) {
+      const qty = Math.ceil(needXp / LV_XP[id]);
+      const cost = qty * LV_PRICE[id];
+      if (!best || cost < best.cost) best = { id: id, qty: qty, cost: cost };
+    }
+    if (!best) return { ok: false, reason: '没有可买的糖果' };
+    best.budget = budget;
+    best.affordable = best.cost <= budget;
+    best.maxQty = Math.floor(budget / LV_PRICE[best.id]);
+    return Object.assign({ ok: true }, best);
+  }
+
+  function lvDialog(text, okText) {
+    return new Promise((resolve) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'pcauto-dialog';
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:2147483200;display:flex;align-items:center;justify-content:center;background:rgba(4,7,14,.62)';
+      const box = document.createElement('div');
+      box.style.cssText = 'max-width:340px;padding:16px 16px 12px;border-radius:14px;border:1px solid #2c3346;background:#141a26;color:#dbe3f0;font:13px/1.6 system-ui,sans-serif;box-shadow:0 18px 50px rgba(0,0,0,.55)';
+      const p = document.createElement('div');
+      p.style.cssText = 'white-space:pre-wrap';
+      p.textContent = text;
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;margin-top:12px';
+      const mk = (label, val, primary) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.style.cssText = 'flex:1;padding:8px;border-radius:9px;cursor:pointer;font:inherit;border:1px solid ' + (primary ? '#3f7bd6' : '#2c3346') + ';background:' + (primary ? '#2f5fa8' : 'transparent') + ';color:' + (primary ? '#fff' : '#c7d0e0');
+        b.onclick = () => { try { wrap.remove(); } catch { } resolve(val); };
+        return b;
+      };
+      row.append(mk('取消', false, false), mk(okText || '购买并使用', true, true));
+      box.append(p, row);
+      wrap.append(box);
+      document.body.append(wrap);
+    });
+  }
+
+  function lvButtonInto(m) {
+    if (!m || !m.querySelector('.dc-candies')) return;
+    if (m.querySelector('#pcauto-lvup')) return;
+    const btn = document.createElement('button');
+    btn.id = 'pcauto-lvup';
+    btn.className = 'dc-candy';
+    btn.title = '用已有经验糖升到下一级；不够时询问是否购买';
+    btn.style.cssText = 'width:auto;padding:0 10px;font:12px/1 system-ui,sans-serif;color:#cfe0ff';
+    btn.textContent = '升到下一级';
+    btn.onclick = (ev) => {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      levelUpHere().then((r) => { if (r) log('info', r); }).catch(() => { });
+    };
+    m.querySelector('.dc-candies').append(btn);
+  }
+
+  async function lvWait(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  function lvFire(el) {
+    if (!el) return;
+    try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch { }
+  }
+
+  async function levelUpHere() {
+    const m = lvModal();
+    if (!m) return '没找到宝可梦详情窗口';
+    if (S.lvBusy) return '正在升中…';
+    const startLv = lvModalLevel(m);
+    if (startLv == null) return '读不到等级，先关掉重开详情';
+    if (startLv >= 100) return '已经是最高等级';
+    const need = lvXpNeed(m);
+    const save = S.save || {};
+    const counts = lvCounts(save);
+    if (lvOwnedXp(counts) <= 0 && !need) return '没有经验糖，也读不到经验值，无法估算';
+
+    S.lvBusy = true;
+    try {
+      let fed = 0;
+      let cur = startLv;
+      const order = lvFeedOrder(counts);
+      for (const id of order) {
+        const idx = LV_CANDIES.indexOf(id);
+        const btn = m.querySelectorAll('.dc-candy')[idx];
+        if (!btn || btn.disabled) continue;
+        lvFire(btn);
+        fed++;
+        await lvWait(520);
+        const lv = lvModalLevel(m);
+        if (lv != null && lv > cur) { cur = lv; break; }
+      }
+      if (cur > startLv) {
+        return `已升到 Lv.${cur}（用掉 ${fed} 颗已有经验糖）`;
+      }
+      // 糖吃完了还不够 → 问要不要买
+      const shortXp = need ? need.need : null;
+      if (!shortXp) {
+        return fed ? `已用掉 ${fed} 颗糖，但读不到还差多少经验，未自动购买` : '没有可用的经验糖，且读不到经验值';
+      }
+      const plan = lvPlanBuy(shortXp, counts, save.money, S.cfg.shopMoneyFloor);
+      if (!plan.ok) return `还差 ${shortXp} 经验，但${plan.reason}`;
+      if (!plan.affordable) {
+        return `还差 ${shortXp} 经验，买 ${plan.qty} 颗${LV_NAME[plan.id]} 需要 ${plan.cost.toLocaleString()} ₽，超出可动用资金（可用 ${plan.budget.toLocaleString()} ₽）`;
+      }
+      const yes = await lvDialog(`还差 ${shortXp.toLocaleString()} 经验。\n需要购买 ${plan.qty} 颗${LV_NAME[plan.id]}，花费 ${plan.cost.toLocaleString()} ₽（现有 ${Number(save.money || 0).toLocaleString()} ₽）。\n是否购买并使用？`, '购买并使用');
+      if (!yes) return '已取消购买';
+      const bought = await lvBuyCandies(plan.id, plan.qty);
+      if (!bought.ok) return '购买失败：' + bought.reason;
+      // 买完回到队伍，重新打开这只的详情，把新糖吃掉
+      const again = await lvAfterBuy();
+      if (!again) return '糖已买到，但没能自动喂（请手动点开该宝可梦再按一次）';
+      return again;
+    } catch (e) {
+      return '升级出错：' + (e && e.message || e);
+    } finally {
+      S.lvBusy = false;
+      S.lastActivityAt = now();
+    }
+  }
+
+  function lvGoto(key) {
+    if (!/^[a-z-]+$/.test(key)) return;
+    const tab = document.querySelector(`#tabs button[data-screen="${key}"]`);
+    if (tab) lvFire(tab);
+  }
+
+  async function lvBuyCandies(id, qty) {
+    const prevId = (document.querySelector('.screen.active') || {}).id || '';
+    const prevKey = prevId.replace(/^screen-/, '') || 'team';
+    let bought = 0;
+    try {
+      const close = lvModal();
+      if (close) { const x = close.querySelector('.dc-x'); if (x) lvFire(x); }
+      await lvWait(300);
+      lvGoto('shop');
+      await lvWait(900);
+      const mode = document.querySelector('#screen-shop [data-sh-mode="buy"]');
+      if (mode && !mode.classList.contains('on')) lvFire(mode);
+      await lvWait(250);
+      for (let i = 0; i < qty; i++) {
+        const row = shopFindRow(id);
+        if (!row) return { ok: false, reason: '货架上找不到 ' + (LV_NAME[id] || id) };
+        if (row.segBtn && !row.segBtn.classList.contains('on')) { lvFire(row.segBtn); await lvWait(160); }
+        lvFire(row.buyBtn);
+        await lvWait(700);
+        const conf = document.querySelector('#modal-root .modal button.btn.primary, #modal-root .modal .btn.primary');
+        if (conf && !conf.closest('.mon-modal')) lvFire(conf);
+        await lvWait(650);
+        bought++;
+      }
+      return { ok: bought > 0, bought: bought, prevKey: prevKey };
+    } catch (e) {
+      return { ok: false, reason: (e && e.message) || '未知错误' };
+    }
+  }
+
+  async function lvAfterBuy() {
+    const slotIdx = S.lvSlot;
+    lvGoto('team');
+    await lvWait(900);
+    const slots = [...document.querySelectorAll('#team-slots .slot.filled')];
+    const slot = slotIdx != null ? slots[slotIdx] : slots[0];
+    if (!slot) return null;
+    lvFire(slot);
+    await lvWait(750);
+    const m = lvModal();
+    if (!m) return null;
+    lvButtonInto(m);
+    const startLv = lvModalLevel(m);
+    const before = lvModalLevel(m);
+    if (startLv == null) return null;
+    let cur = before;
+    for (const id of LV_CANDIES) {
+      const idx = LV_CANDIES.indexOf(id);
+      const btn = m.querySelectorAll('.dc-candy')[idx];
+      if (!btn || btn.disabled) continue;
+      lvFire(btn);
+      await lvWait(520);
+      const lv = lvModalLevel(m);
+      if (lv != null && lv > cur) { cur = lv; break; }
+    }
+    return cur > startLv ? `已升到 Lv.${cur}` : null;
+  }
+
+
+  // 每拍检查：详情弹窗开着就把按钮挂上去（弹窗升级后会重绘，所以要反复补）
+  function lvTick() {
+    const m = lvModal();
+    if (!m) { if (S.lvBusy) return; S.lvSeenModal = false; return; }
+    S.lvSeenModal = true;
+    lvButtonInto(m);
+  }
+
+
   /* ====================== 主循环 ====================== */
 
   let wakeLock = null;
@@ -4136,6 +4396,7 @@
       handleCutscene();
       handleModals();
       handleItemChoice();
+      lvTick();             // 详情弹窗开着就把「升到下一级」按钮挂上去
       battleTick();          // 战斗遥测：维护 S.battle，结束时落一条区域战绩
       smartSwitch();         // 残血 / 劣势换人（内部按开关决定要不要动手）
       // 低频（约 2 秒）：本身就带长冷却的模块，没必要每 350ms 查一遍 DOM
@@ -4155,6 +4416,15 @@
     if (document.getElementById('pcauto-hud')) return;
     buildHud();
     renderHud();
+    // 详情弹窗不暴露 uid，只能用「点的是队伍第几只」把同一只找回来
+    document.addEventListener('pointerdown', (ev) => {
+      const t = ev.target;
+      const slot = t && t.closest && t.closest('#team-slots .slot');
+      if (!slot) return;
+      const filled = [...document.querySelectorAll('#team-slots .slot.filled')];
+      const i = filled.indexOf(slot);
+      if (i >= 0) S.lvSlot = i;
+    }, true);
     log('info', `挂机助手 v${VERSION} 已启动`);
     if (restoredFrom) {
       // 用章节、图鉴、捕获数核对：游戏启动后会马上再存档（lastTick 变化），不能比较整个字符串
@@ -4173,7 +4443,7 @@
     if (!S.awaySnap) { S.awaySnap = tallySnap(); S.awayLastSeen = now(); }
 
     // 挂到页面的 window 上，控制台里才能访问
-    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats }; } catch { /* 忽略 */ }
+    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed }; } catch { /* 忽略 */ }
     ensureRealDescs();   // 先存下原始描述符，之后无论保活开没开，isRealHidden() 都能读到真值
     startGradeWatcher();
     safeInterval('tick', tick, TICK_MS);

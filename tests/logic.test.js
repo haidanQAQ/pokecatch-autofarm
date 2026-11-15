@@ -123,7 +123,8 @@ function makeEnv(opts = {}) {
     return { shopPlan, autoShop, settleShop, shopFindRow, shopDiag, ledgerTick, ledgerAdd, ledgerToday, ledgerData,
              ledgerCsv, dayKey, dexGap, dexGapText, daycareState, daycareTick, dailyReportText, NEW_DAY,
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
-             btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml };`);
+             btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
+             lvParseNum, lvPlanBuy, lvOwnedXp, lvFeedOrder, lvXpNeed, lvCounts };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -535,6 +536,60 @@ function rebuild(env, body) {
   const html2 = env.api.btHudHtml();
   ok(html2.includes('本区战绩'), '有战绩时显示本区战绩');
   ok(html2.includes('1 战 1 胜'), '战绩数字正确');
+}
+
+/* ---------------- 13. 升到下一级（读经验条 / 买糖估价） ---------------- */
+
+{
+  const env = makeEnv({ save: { money: 100000, items: { 'exp-candy-s': 2, 'exp-candy-xl': 1 } } });
+  const api = env.api;
+
+  /* 数字解析：中文界面「经验值 1,200 / 34,000」这类文案要能读 */
+  eq(api.lvParseNum('1,200'), 1200, '带千分位');
+  eq(api.lvParseNum('34 000'), 34000, '带空格分隔');
+  eq(api.lvParseNum('3.5k'), 3500, 'k 后缀');
+  eq(api.lvParseNum('1.2M'), 1200000, 'M 后缀');
+  eq(api.lvParseNum('经验值 1,200 / 34,000'), 1200, '只取第一个数');
+  eq(api.lvParseNum('没有数字'), null, '没有数字返回 null');
+
+  /* 经验条：XP a / b → 还差多少 */
+  const modal = (txt) => ({ querySelector: (sel) => (sel.includes('xpbar') ? { textContent: txt } : null) });
+  const need1 = api.lvXpNeed(modal('经验值 1,200 / 34,000'));
+  eq(need1.cur, 1200, '当前经验');
+  eq(need1.max, 34000, '升级所需');
+  eq(need1.need, 32800, '还差的经验');
+  eq(api.lvXpNeed(modal('乱码文案')), null, '读不到就返回 null，不瞎猜');
+
+  /* 自己有多少糖 = 多少经验 */
+  const counts = api.lvCounts(env.S.save);
+  eq(counts['exp-candy-s'], 2, '小糖 2 颗');
+  eq(counts['exp-candy-m'], 0, '没有中糖');
+  eq(api.lvOwnedXp(counts), 2 * 1000 + 250000, '总经验 = 2×1000 + 1×250000');
+
+  /* 吃糖顺序：小的先吃，避免一颗大糖直接跳好几级 */
+  const order = api.lvFeedOrder(counts);
+  eq(order.length, 3, '三颗糖的吃法');
+  eq(order[0], 'exp-candy-s', '先吃小糖');
+  eq(order[2], 'exp-candy-xl', '最后才吃大糖');
+
+  /* 缺糖时怎么买最便宜：按「总花费」比，不是按单价 */
+  const p1 = api.lvPlanBuy(250000, counts, 100000, 20000);
+  eq(p1.ok, true, '可以买');
+  eq(p1.id, 'exp-candy-xl', '补 25 万经验最省的是 XL（48,000）');
+  eq(p1.qty, 1, '一颗就够');
+  eq(p1.cost, 48000, '花费 48,000');
+  eq(p1.affordable, true, '预算内');
+
+  const p2 = api.lvPlanBuy(20000, {}, 100000, 20000);
+  eq(p2.id, 'exp-candy-m', '补 2 万经验最省的是 M（2 颗 14,400）');
+  eq(p2.cost, 14400, '花费 14,400');
+
+  const p3 = api.lvPlanBuy(20000, {}, 30000, 20000);
+  eq(p3.affordable, false, '只剩 10,000 可用就不够');
+  eq(p3.maxQty, 1, '能买 1 颗');
+
+  eq(api.lvPlanBuy(0, {}, 999999, 0).ok, false, '不缺经验就不买');
+  eq(api.lvPlanBuy(5000, {}, 10000, 20000).ok, false, '金钱低于保留线不买');
 }
 
 /* ---------------- 汇总 ---------------- */

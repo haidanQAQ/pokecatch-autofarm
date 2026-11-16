@@ -33,6 +33,7 @@ function makeEnv(opts = {}) {
   const logs = [];
   const push = [];
   const downloads = [];
+  const reloads = [];
 
   const S = {
     cfg: Object.assign({
@@ -56,6 +57,10 @@ function makeEnv(opts = {}) {
       battleWarnStreak: 3,
       autoSwitch: false,
       switchAtHp: 30,
+      // 定时刷新
+      autoReload: false,
+      reloadEveryMin: 30,
+      reloadIdleGuard: true,
     }, opts.cfg || {}),
     keepAliveOn: false,
     save: opts.save || null,
@@ -66,6 +71,7 @@ function makeEnv(opts = {}) {
     deaths: 0,
     switchAt: 0,
     feeding: false,
+    reloadHoldAt: 0,
   };
 
   const BERRY_BUFFS = {
@@ -88,6 +94,10 @@ function makeEnv(opts = {}) {
     now: () => (env.clock ? env.clock : Date.now()),
     lsGet: (k) => (store.has(k) ? store.get(k) : null),
     lsSet: (k, v) => { store.set(k, v); return true; },
+    gmGet: (k, fb) => (store.has(k) ? store.get(k) : fb),
+    gmSet: (k, v) => { store.set(k, v); return true; },
+    PAGE_WIN: { location: { reload: () => { env.reloads.push(Date.now()); } } },
+    $: (sel, root) => (root || env.document).querySelector(sel),
     safeParse: (raw, fb) => { try { const v = JSON.parse(raw); return v == null ? fb : v; } catch { return fb; } },
     document: {
       querySelector: () => null, querySelectorAll: () => [],
@@ -119,6 +129,7 @@ function makeEnv(opts = {}) {
   env.logs = logs;
   env.push = push;
   env.downloads = downloads;
+  env.reloads = reloads;
   env.store = store;
 
   const names = Object.keys(env);
@@ -128,7 +139,9 @@ function makeEnv(opts = {}) {
              btPct, btSpriteId, btLevel, btForecast, btBenchCandidates, btZone, btData, btRecord,
              btZoneStats, battleTick, btStreakWarn, btLeadPick, smartSwitch, btHudHtml,
              lvParseNum, lvPlanBuy, lvOwnedXp, lvCoverPlan, lvXpNeed, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount,
-             evoParseItemId, evoItemSlots, evoNeedsBuy, evoInject, evoItemCn };`);
+             evoParseItemId, evoItemSlots, evoNeedsBuy, evoInject, evoItemCn,
+             reloadIntervalMs, reloadLastAt, reloadNextAt, reloadLeftMs, reloadBlocked, reloadNow,
+             reloadTick, reloadStatusText, reloadDiag };`);
   env.api = factory(...names.map((n) => env[n]));
   return env;
 }
@@ -716,6 +729,77 @@ function rebuild(env, body) {
   ok(/买了也用不上/.test(b2.afterEl.title), 'title 说清为什么买了没用');
 }
 
+/* ---------------- 9. 定时刷新页面（间隔自填 + 忙时避开） ---------------- */
+
+{
+  const env = makeEnv({ cfg: { autoReload: true, reloadEveryMin: 30 } });
+  const api = env.api;
+  const flush = () => { env.timers.splice(0).forEach((f) => f()); };
+
+  /* 间隔换算：非法值回落到 30 分钟，超出范围夹到 1–1440 */
+  eq(api.reloadIntervalMs(), 1800000, '默认 30 分钟');
+  env.S.cfg.reloadEveryMin = 5;
+  eq(api.reloadIntervalMs(), 300000, '填 5 就是 5 分钟');
+  env.S.cfg.reloadEveryMin = 1.4;
+  eq(api.reloadIntervalMs(), 60000, '小数四舍五入到整分钟');
+  env.S.cfg.reloadEveryMin = 0;
+  eq(api.reloadIntervalMs(), 1800000, '填 0 按 30 分钟兜底');
+  env.S.cfg.reloadEveryMin = 'abc';
+  eq(api.reloadIntervalMs(), 1800000, '填垃圾值按 30 分钟兜底');
+  env.S.cfg.reloadEveryMin = 5000;
+  eq(api.reloadIntervalMs(), 1440 * 60000, '超过一天就夹到 1440 分钟');
+  env.S.cfg.reloadEveryMin = 30;
+
+  /* 第一次 tick 只记起点，不刷 */
+  env.clock = 1000000;
+  api.reloadTick();
+  eq(env.reloads.length, 0, '第一次只记起点不刷新');
+  eq(api.reloadLastAt(), 1000000, '起点时间已记下');
+
+  /* 没到点不刷 */
+  env.clock = 1000000 + 29 * 60000;
+  api.reloadTick();
+  eq(env.reloads.length, 0, '差一分钟不刷新');
+  eq(api.reloadStatusText(), '1:00', '倒计时剩 1:00');
+
+  /* 到点就刷，且记次数 */
+  env.document.querySelector = (sel) => (sel === '#save-btn' ? { id: 'save-btn' } : null);
+  env.clock = 1000000 + 31 * 60000;
+  api.reloadTick();
+  flush();
+  eq(env.reloads.length, 1, '到点刷新一次');
+  eq(env.fired.length, 1, '刷新前先点了一次保存');
+  eq(api.reloadDiag().count, 1, '刷新次数记成 1');
+
+  /* 忙的时候先不刷 */
+  const busy = makeEnv({ cfg: { autoReload: true, reloadEveryMin: 1 } });
+  busy.clock = 2000000;
+  busy.api.reloadTick();
+  busy.clock = 2000000 + 2 * 60000;
+  busy.document.querySelector = (sel) => (sel === '.mon-modal' ? {} : null);
+  busy.api.reloadTick();
+  busy.timers.splice(0).forEach((f) => f());
+  eq(busy.reloads.length, 0, '详情弹窗开着就不刷');
+  eq(busy.api.reloadBlocked(), '详情弹窗还开着', '说得出卡在哪一步');
+  ok(busy.logs.some((l) => /先等一等/.test(l)), '日志提示在等');
+
+  /* 关掉守卫就照刷不误 */
+  busy.S.cfg.reloadIdleGuard = false;
+  busy.api.reloadTick();
+  busy.timers.splice(0).forEach((f) => f());
+  eq(busy.reloads.length, 1, '关掉守卫后照样刷新');
+  eq(busy.api.reloadBlocked(), '', '守卫关掉后不再拦');
+
+  /* 关掉开关就完全不动 */
+  const off = makeEnv({ cfg: { autoReload: false, reloadEveryMin: 1 } });
+  off.clock = 3000000;
+  off.api.reloadTick();
+  off.clock = 3000000 + 10 * 60000;
+  off.api.reloadTick();
+  eq(off.reloads.length, 0, '开关关着不刷新');
+  eq(off.api.reloadStatusText(), '', '关着就不显示倒计时');
+}
+
 /* ---------------- 汇总 ---------------- */
 
 console.log(`\n通过 ${pass} 项`);
@@ -724,4 +808,4 @@ if (fails.length) {
   fails.forEach((f) => console.log('  ✗ ' + f));
   process.exit(1);
 }
-console.log('✅ 3.7 – 3.9.5 新增逻辑全部通过');
+console.log('✅ 3.7 – 3.9.6 新增逻辑全部通过');

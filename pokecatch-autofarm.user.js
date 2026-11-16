@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poke'Catch 挂机助手 · AutoFarm
 // @namespace    https://pokecatch-online.netlify.app/
-// @version      3.9.5
+// @version      3.9.6
 // @description  自动 ×3 加速、自动关闭捕获图鉴卡与确认弹窗、自动进化/保存、实时产出面板、闪光与活动提醒、停滞自愈、存档备份、离开战报、手机推送；3.7 新增每日收益账本、图鉴缺口、培育屋监控；3.8 新增战斗遥测对位卡、智能换人、区域战绩与连败提醒；3.8.1 修正商店：货架固定且不卖树果，改为自动买经验糖；3.9.3 「升到下一级」改为批量连点喂糖与 ×10 下单，整体快一个数量级
 // @author       YG
 // @match        https://pokecatch-online.netlify.app/*
@@ -24,7 +24,7 @@
 
   /* ====================== 基础常量 ====================== */
 
-  const VERSION = '3.9.5';   // ⚠ 修改时请同步顶部的 @version
+  const VERSION = '3.9.6';   // ⚠ 修改时请同步顶部的 @version
   // 加了 @grant 之后油猴会把脚本放进沙箱，window 不再是页面的 window；需要碰页面对象时用它
   const PAGE_WIN = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   // 改写可见性必须作用在页面自己的 document 上，否则游戏看不到
@@ -118,6 +118,9 @@
     ledger: true,             // 每日产出账本
     dailyReport: true,        // 每天推一次「昨日战报 + 图鉴缺口」
     dailyReportHour: 8,       // 几点推
+    autoReload: false,        // 定时刷新页面
+    reloadEveryMin: 30,       // 每隔多少分钟刷一次
+    reloadIdleGuard: true,    // 正在操作 / 弹窗开着 / 战斗中先不刷
     // 战斗辅助（战斗本身全自动，选招/丢球/逃跑都由游戏决定，这里只做遥测 / 换人 / 复盘）
     battlePanel: true,        // HUD 显示对位与胜率
     battleSwitchSmart: false, // 劣势换人（按对位胜率挑最克制的替补，默认关：会和你抢操作）
@@ -1495,6 +1498,7 @@
     modalHandledAt: 0,
     unknownModal: '',
     lastEvoAt: 0,
+    reloadHoldAt: 0,
     evoFail: 0,
     evoBefore: 0,
     lastTick: 0,
@@ -2887,7 +2891,8 @@
       ${row('闪光', String(S.shinySession), S.shinySession ? '#f472b6' : undefined)}
       ${row('夜间捕获', String(S.phaseCatch[2] || 0), (ph.idx === 2 && !(S.phaseCatch[2] > 0)) ? '#f59e0b' : '#93c5fd')}
       ${row('无进展', idle + ' 秒', idle > 90 ? '#f59e0b' : undefined)}
-      ${row('运行', ((now() - S.bootAt) / 60000).toFixed(0) + ' 分钟')}
+      ${S.cfg.autoReload ? row('刷新', reloadStatusText() ? reloadStatusText() + ' 后' : '待计时') : ''}
+        ${row('运行', ((now() - S.bootAt) / 60000).toFixed(0) + ' 分钟')}
       ${S.unknownModal ? `<div style="margin-top:6px;padding:6px;border-radius:8px;background:rgba(245,158,11,.13);color:#fbbf24;font-size:11px">需手动点击：${esc(S.unknownModal.slice(0, 64))}</div>` : ''}`;
 
     if (S.logDirty) {
@@ -3000,6 +3005,14 @@
       ${chk('powerGuard', '战力 / 胜率告警')}
       ${chk('teamAdvisor', '配队建议提醒（队伍明显落后时日志提示）')}
 
+      ${group('定时刷新')}
+      ${chk('autoReload', '定时自动刷新页面（长时间挂机卡住时靠它自愈）')}
+      ${num('reloadEveryMin', '每隔多少分钟刷新一次', 1, 1440, 1)}
+      ${chk('reloadIdleGuard', '正在操作 / 弹窗开着 / 战斗中时先不刷')}
+      <div class="row" style="gap:6px;margin-top:6px;flex-wrap:wrap">
+        <button class="btn small" id="pcauto-reload-now" style="width:auto;padding:0 10px">立即刷新</button>
+        <span class="muted" style="font-size:11px;line-height:1.4">刷新前会先点一次保存；进度本来就存在浏览器本地，刷新不丢档。</span>
+      </div>
       ${group('对战辅助')}
       ${chk('grindMode', '道馆 / 四天王死磕（失败后自动继续）')}
       ${chk('autoSwitch', '残血自动换人（会覆盖手动操作）')}
@@ -3260,6 +3273,8 @@
     /* ---- 采购 / 账本 / 图鉴 ---- */
     const shopNowBtn = $('#pcauto-shop-now', box);
     if (shopNowBtn) shopNowBtn.onclick = () => { box.remove(); S.shopAt = 0; autoShop(true); };
+    const reloadBtn = $('#pcauto-reload-now', box);
+    if (reloadBtn) reloadBtn.onclick = () => { reloadNow('手动'); renderHud(); };
     const evoDiagBtn = $('#pcauto-evo-diag', box);
     if (evoDiagBtn) evoDiagBtn.onclick = () => { evoDiag(); };
     const shopDiagBtn = $('#pcauto-shop-diag', box);
@@ -4691,6 +4706,94 @@
     evoInject(m);      // 需要素材才能进化的，就地给一个「买素材」按钮
   }
 
+  /* ====================== 模块：定时刷新页面 ====================== */
+
+  // 只把「上次刷新时间 + 次数」存进 localStorage：刷新之后计时能接上，
+  // 不会因为刚刷完页面就从头再数 N 分钟。
+  const RELOAD_KEY = 'pcauto.reload.v1';
+
+  function reloadData() {
+    const d = gmGet(RELOAD_KEY, null);
+    return d && typeof d === 'object' ? d : {};
+  }
+  function reloadSet(d) { gmSet(RELOAD_KEY, d); }
+
+  /** 间隔（毫秒）：1–1440 分钟；填了非法值就按 30 分钟 */
+  function reloadIntervalMs() {
+    const m = Number(S.cfg.reloadEveryMin);
+    const v = Number.isFinite(m) && m > 0 ? m : 30;
+    return Math.max(1, Math.min(1440, Math.round(v))) * 60000;
+  }
+
+  function reloadLastAt() { return Number(reloadData().at) || 0; }
+  function reloadNextAt() { const at = reloadLastAt(); return at ? at + reloadIntervalMs() : 0; }
+  function reloadLeftMs() { const nx = reloadNextAt(); return nx ? Math.max(0, nx - now()) : 0; }
+
+  /** 现在不适合刷新的原因；空串表示可以刷 */
+  function reloadBlocked() {
+    if (!S.cfg.reloadIdleGuard) return '';
+    if (S.feeding || S.evoBusy) return '正在执行一键操作';
+    if (userBusy()) return '你正在操作';
+    if (document.querySelector('.mon-modal')) return '详情弹窗还开着';
+    if (document.querySelector('#modal-root .modal')) return '有弹窗没关';
+    if (document.querySelector('#arena .enemy')) return '正在战斗';
+    return '';
+  }
+
+  /** 手动 / 自动共用：先点一次保存，再刷新 */
+  function reloadNow(why) {
+    const sb = $('#save-btn');
+    if (sb) { try { fire(sb); } catch { /* 忽略 */ } }
+    const d = reloadData();
+    const n = (Number(d.n) || 0) + 1;
+    reloadSet({ at: now(), n: n, why: why || '定时' });
+    log('info', '刷新页面（' + (why || '定时') + '），累计 ' + n + ' 次');
+    setTimeout(() => { try { PAGE_WIN.location.reload(); } catch { /* 忽略 */ } }, 320);
+  }
+
+  function reloadTick() {
+    if (!S.cfg.autoReload) return;
+    const last = reloadLastAt();
+    if (!last) { reloadSet({ at: now(), n: 0, why: '启动' }); return; }   // 第一次只记起点
+    if (now() - last < reloadIntervalMs()) return;
+    const why = reloadBlocked();
+    if (why) {
+      if (now() - (S.reloadHoldAt || 0) > 60000) {
+        S.reloadHoldAt = now();
+        log('info', '该刷新了，先等一等：' + why);
+      }
+      return;
+    }
+    reloadNow('定时');
+  }
+
+  /** HUD 倒计时文案：分:秒 */
+  function reloadStatusText() {
+    if (!S.cfg.autoReload) return '';
+    const nx = reloadNextAt();
+    if (!nx) return '待计时';
+    const left = reloadLeftMs();
+    const mm = Math.floor(left / 60000);
+    const ss = Math.floor((left % 60000) / 1000);
+    return mm + ':' + (ss < 10 ? '0' + ss : String(ss));
+  }
+
+  /** 诊断：控制台里看一眼当前计时与拦截原因 */
+  function reloadDiag() {
+    const d = reloadData();
+    const at = Number(d.at) || 0;
+    const info = {
+      intervalMin: Math.round(reloadIntervalMs() / 60000),
+      lastAt: at,
+      leftMs: reloadLeftMs(),
+      blocked: reloadBlocked(),
+      count: Number(d.n) || 0,
+    };
+    log('info', '刷新间隔 ' + info.intervalMin + ' 分钟｜上次 ' + (at ? new Date(at).toLocaleString() : '没有') +
+      '｜剩余 ' + reloadStatusText() + '｜能不能刷：' + (info.blocked || '能'));
+    return info;
+  }
+
   /* ====================== 主循环 ====================== */
 
   let wakeLock = null;
@@ -4744,6 +4847,7 @@
         daycareTick();
         maybeEvolve();
         maybeSave();
+        reloadTick();
       }
     } catch { /* 静默 */ }
   }
@@ -4779,7 +4883,7 @@
     if (!S.awaySnap) { S.awaySnap = tallySnap(); S.awayLastSeen = now(); }
 
     // 挂到页面的 window 上，控制台里才能访问
-    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed, lvCoverPlan, lvOwnedXp, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount, lvFeedFast, lvBuyFast, evoDiag, evoItemSlots, evoNeedsBuy, evoParseItemId, evoBuyAndEvolve, lvReopen }; } catch { /* 忽略 */ }
+    try { PAGE_WIN.__pcauto = { S, version: VERSION, sample, tick, openSettings, setKeepAlive, phaseInfo, nodeIndoor, feedAllCandy, backupNow, openTeamAdvisor, taAnalyze, taSuggestTeam, taEnemyPool, taNextGym, battleProbe, battleDiag, btLeadPick, btOrderNow, btZoneStats, levelUpHere, lvPlanBuy, lvParseNum, lvXpNeed, lvCoverPlan, lvOwnedXp, lvCounts, lvBreakdown, lvXpMap, lvPlanText, lvBurstCount, lvFeedFast, lvBuyFast, evoDiag, evoItemSlots, evoNeedsBuy, evoParseItemId, evoBuyAndEvolve, lvReopen, reloadNow, reloadTick, reloadStatusText, reloadIntervalMs, reloadDiag }; } catch { /* 忽略 */ }
     ensureRealDescs();   // 先存下原始描述符，之后无论保活开没开，isRealHidden() 都能读到真值
     startGradeWatcher();
     safeInterval('tick', tick, TICK_MS);
